@@ -224,6 +224,39 @@ func TestBuildCommand(t *testing.T) {
 	assert.Equal(t, []string{"CONFIG=release", "GOOS=" + currentOS, "ARCH=" + currentArch}, capturedOtherArgs)
 }
 
+func TestBuildJSONRequiresPlan(t *testing.T) {
+	err := Build(&flags.Build{JSON: true}, nil)
+	assert.EqualError(t, err, "--json requires --plan")
+}
+
+func TestTargetFromArgs(t *testing.T) {
+	t.Setenv("GOOS", "linux")
+	t.Setenv("GOARCH", "amd64")
+
+	target, arch := targetFromArgs([]string{"GOOS=darwin", "ARCH=arm64"})
+	assert.Equal(t, "darwin", target)
+	assert.Equal(t, "arm64", arch)
+
+	target, arch = targetFromArgs([]string{"GOARCH=386"})
+	assert.Equal(t, "linux", target)
+	assert.Equal(t, "386", arch)
+}
+
+func TestBuildStepInvocation(t *testing.T) {
+	step, args, err := buildStepInvocation([]string{"step", "native.compile", "GOOS=linux"})
+	assert.NoError(t, err)
+	assert.Equal(t, "native.compile", step)
+	assert.Equal(t, []string{"GOOS=linux"}, args)
+
+	step, args, err = buildStepInvocation([]string{"GOOS=linux"})
+	assert.NoError(t, err)
+	assert.Empty(t, step)
+	assert.Equal(t, []string{"GOOS=linux"}, args)
+
+	_, _, err = buildStepInvocation([]string{"step"})
+	assert.EqualError(t, err, "usage: wails3 build step <stage> [GOOS=...] [GOARCH=...]")
+}
+
 func TestBuildCommandWithTags(t *testing.T) {
 	currentOS := runtime.GOOS
 	currentArch := runtime.GOARCH

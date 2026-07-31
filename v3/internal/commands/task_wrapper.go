@@ -1,11 +1,13 @@
 package commands
 
 import (
+	"fmt"
 	"os"
 	"runtime"
 	"slices"
 	"strings"
 
+	"github.com/wailsapp/wails/v3/internal/buildsystem"
 	"github.com/wailsapp/wails/v3/internal/buildwarnings"
 	"github.com/wailsapp/wails/v3/internal/flags"
 	"github.com/wailsapp/wails/v3/internal/term"
@@ -67,6 +69,19 @@ func mergeTags(tags string, extra ...string) string {
 
 func Build(buildFlags *flags.Build, otherArgs []string) error {
 	buildFlags.Tags = mergeTags(buildFlags.Tags, envTags()...)
+	step, pipelineArgs, err := buildStepInvocation(otherArgs)
+	if err != nil {
+		return err
+	}
+	if buildFlags.JSON && !buildFlags.Plan {
+		return fmt.Errorf("--json requires --plan")
+	}
+	if buildFlags.Plan {
+		return printBuildPlan(buildFlags, pipelineArgs, step)
+	}
+	if buildFlags.Pipeline || buildFlags.From != "" || buildFlags.Until != "" || step != "" {
+		return executeBuildPipeline(buildFlags, pipelineArgs, step)
+	}
 	if buildFlags.Tags != "" {
 		otherArgs = append(otherArgs, "EXTRA_TAGS="+buildFlags.Tags)
 	}
@@ -77,6 +92,62 @@ func Build(buildFlags *flags.Build, otherArgs []string) error {
 		otherArgs = append(otherArgs, "GARBLE_ARGS="+buildFlags.GarbleArgs)
 	}
 	return wrapTask("build", otherArgs)
+}
+
+func buildStepInvocation(args []string) (string, []string, error) {
+	if len(args) == 0 || args[0] != "step" {
+		return "", args, nil
+	}
+	if len(args) < 2 || strings.Contains(args[1], "=") {
+		return "", nil, fmt.Errorf("usage: wails3 build step <stage> [GOOS=...] [GOARCH=...]")
+	}
+	return args[1], args[2:], nil
+}
+
+func printBuildPlan(buildFlags *flags.Build, otherArgs []string, step string) error {
+	target, arch := targetFromArgs(otherArgs)
+	plan, err := buildsystem.Resolve(buildsystem.Request{
+		ConfigPath: buildFlags.Config,
+		Target:     target,
+		Arch:       arch,
+		Mode:       "production",
+		Tags:       strings.Split(buildFlags.Tags, ","),
+		Obfuscated: buildFlags.Obfuscated,
+	})
+	if err != nil {
+		return err
+	}
+	DisableFooter = true
+	if step != "" {
+		inspection, err := buildsystem.InspectStage(plan, step)
+		if err != nil {
+			return err
+		}
+		if buildFlags.JSON {
+			return buildsystem.WriteStageJSON(os.Stdout, inspection)
+		}
+		return buildsystem.WriteStageText(os.Stdout, inspection)
+	}
+	if buildFlags.JSON {
+		return buildsystem.WriteJSON(os.Stdout, plan)
+	}
+	return buildsystem.WriteText(os.Stdout, plan)
+}
+
+func targetFromArgs(args []string) (string, string) {
+	target := os.Getenv("GOOS")
+	arch := os.Getenv("GOARCH")
+	for _, arg := range args {
+		switch {
+		case strings.HasPrefix(arg, "GOOS="):
+			target = strings.TrimPrefix(arg, "GOOS=")
+		case strings.HasPrefix(arg, "GOARCH="):
+			arch = strings.TrimPrefix(arg, "GOARCH=")
+		case strings.HasPrefix(arg, "ARCH="):
+			arch = strings.TrimPrefix(arg, "ARCH=")
+		}
+	}
+	return target, arch
 }
 
 func Package(_ *flags.Package, otherArgs []string) error {

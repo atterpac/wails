@@ -41,6 +41,7 @@ func main() {
 	build.Action(func() error {
 		return commands.Build(&buildFlags, build.OtherArgs())
 	})
+	build.LongDescription("\nUsage:\n  wails3 build [flags]\n  wails3 build step <stage> [flags]\n\nUse --plan to inspect the typed pipeline, --pipeline to execute it, or --from/--until to execute a stage range.")
 
 	app.NewSubCommandFunction("dev", "Run in Dev mode", commands.Dev)
 
