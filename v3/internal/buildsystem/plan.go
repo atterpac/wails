@@ -55,6 +55,8 @@ type Target struct {
 
 type Stage struct {
 	ID             string     `json:"id"`
+	Instance       string     `json:"instance"`
+	Target         *Target    `json:"target,omitempty"`
 	Implementation string     `json:"implementation"`
 	Needs          []string   `json:"needs,omitempty"`
 	Status         string     `json:"status"`
@@ -68,9 +70,20 @@ type Stage struct {
 }
 
 type Artifact struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
-	Path string `json:"path,omitempty"`
+	ID       string          `json:"id"`
+	Name     string          `json:"name"`
+	Type     string          `json:"type"`
+	Path     string          `json:"path,omitempty"`
+	Producer string          `json:"producer,omitempty"`
+	Target   *ArtifactTarget `json:"target,omitempty"`
+}
+
+// ArtifactTarget identifies the target-specific variant of an artifact.
+// Format is populated by fan-out stages such as package.create.
+type ArtifactTarget struct {
+	Platform string `json:"platform,omitempty"`
+	Arch     string `json:"arch,omitempty"`
+	Format   string `json:"format,omitempty"`
 }
 
 type ActionKind string
