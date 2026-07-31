@@ -40,76 +40,103 @@ func Execute(ctx context.Context, plan *Plan, options ExecuteOptions) error {
 	if plan == nil {
 		return errors.New("build plan is nil")
 	}
+	if err := Validate(plan); err != nil {
+		return fmt.Errorf("validate build plan: %w", err)
+	}
 	if options.Stdout == nil {
 		options.Stdout = os.Stdout
 	}
 	if options.Stderr == nil {
 		options.Stderr = os.Stderr
 	}
-
-	first, last, err := executionRange(plan.Stages, options)
+	order, selected, err := executionOrder(plan.Stages, options)
 	if err != nil {
 		return err
 	}
-	artifacts := collectArtifacts(plan.Stages[:first])
+	artifacts := collectArtifacts(prerequisiteStages(plan.Stages, selected))
+	return executeSequential(ctx, plan, options, order, artifacts)
+}
 
-	for index := first; index <= last; index++ {
+func executeSequential(
+	ctx context.Context,
+	plan *Plan,
+	options ExecuteOptions,
+	order []int,
+	artifacts map[string]Artifact,
+) error {
+	for _, index := range order {
 		stage := plan.Stages[index]
-		if stage.Status == "skipped" {
-			notifyStage(options, stage, "skipped")
-			continue
-		}
-
-		stageContext := &StageContext{
-			Plan:      plan,
-			Stage:     stage,
-			Artifacts: artifacts,
-			Stdout:    options.Stdout,
-			Stderr:    options.Stderr,
-		}
-		if err := verifyInputs(plan.Project.Root, stage); err != nil {
+		outputs, err := executeStage(ctx, plan, stage, options, artifacts)
+		if err != nil {
 			return err
 		}
-		notifyStage(options, stage, "running")
-		if err := executeHooks(ctx, stageContext, stage.Before); err != nil {
-			return fmt.Errorf("stage %s before hook: %w", stage.ID, err)
-		}
-		if stage.Replacement != nil {
-			if err := executeCommand(
-				ctx,
-				stageContext,
-				appendCommand(stage.Replacement),
-				stage.Replacement.WorkingDirectory,
-				stage.Replacement.Environment,
-				"",
-			); err != nil {
-				return fmt.Errorf("stage %s replacement: %w", stage.ID, err)
-			}
-		} else if len(stage.Actions) > 0 {
-			if err := executeActions(ctx, stageContext, options); err != nil {
-				return fmt.Errorf("stage %s: %w", stage.ID, err)
-			}
-		} else {
-			implementation := options.Builtins[stage.ID]
-			if implementation == nil {
-				return fmt.Errorf("stage %s has no built-in implementation", stage.ID)
-			}
-			if err := implementation(ctx, stageContext); err != nil {
-				return fmt.Errorf("stage %s: %w", stage.ID, err)
-			}
-		}
-		for _, output := range stage.Outputs {
-			stageContext.Artifacts[output.Name] = output
-		}
-		if err := executeHooks(ctx, stageContext, stage.After); err != nil {
-			return fmt.Errorf("stage %s after hook: %w", stage.ID, err)
-		}
-		if err := verifyOutputs(plan.Project.Root, stage); err != nil {
-			return err
-		}
-		notifyStage(options, stage, "completed")
+		registerArtifacts(artifacts, outputs)
 	}
 	return nil
+}
+
+func executeStage(
+	ctx context.Context,
+	plan *Plan,
+	stage Stage,
+	options ExecuteOptions,
+	artifacts map[string]Artifact,
+) ([]Artifact, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if stage.Status == "skipped" {
+		notifyStage(options, stage, "skipped")
+		return nil, nil
+	}
+
+	stageContext := &StageContext{
+		Plan:      plan,
+		Stage:     stage,
+		Artifacts: cloneArtifacts(artifacts),
+		Stdout:    options.Stdout,
+		Stderr:    options.Stderr,
+	}
+	if err := verifyInputs(plan.Project.Root, stage); err != nil {
+		return nil, err
+	}
+	notifyStage(options, stage, "running")
+	if err := executeHooks(ctx, stageContext, stage.Before); err != nil {
+		return nil, fmt.Errorf("stage %s before hook: %w", stage.Reference(), err)
+	}
+	if stage.Replacement != nil {
+		if err := executeCommand(
+			ctx,
+			stageContext,
+			appendCommand(stage.Replacement),
+			stage.Replacement.WorkingDirectory,
+			stage.Replacement.Environment,
+			"",
+		); err != nil {
+			return nil, fmt.Errorf("stage %s replacement: %w", stage.Reference(), err)
+		}
+	} else if len(stage.Actions) > 0 {
+		if err := executeActions(ctx, stageContext, options); err != nil {
+			return nil, fmt.Errorf("stage %s: %w", stage.Reference(), err)
+		}
+	} else {
+		implementation := options.Builtins[stage.ID]
+		if implementation == nil {
+			return nil, fmt.Errorf("stage %s has no built-in implementation", stage.Reference())
+		}
+		if err := implementation(ctx, stageContext); err != nil {
+			return nil, fmt.Errorf("stage %s: %w", stage.Reference(), err)
+		}
+	}
+	registerArtifacts(stageContext.Artifacts, stage.Outputs)
+	if err := executeHooks(ctx, stageContext, stage.After); err != nil {
+		return nil, fmt.Errorf("stage %s after hook: %w", stage.Reference(), err)
+	}
+	if err := verifyOutputs(plan.Project.Root, stage); err != nil {
+		return nil, err
+	}
+	notifyStage(options, stage, "completed")
+	return stage.Outputs, nil
 }
 
 func executeActions(ctx context.Context, stageContext *StageContext, options ExecuteOptions) error {
@@ -221,48 +248,169 @@ func copyFile(source, destination string) error {
 	return output.Close()
 }
 
-func executionRange(stages []Stage, options ExecuteOptions) (int, int, error) {
-	first, last := 0, len(stages)-1
-	if options.Step != "" {
-		index := stageIndex(stages, options.Step)
-		if index < 0 {
-			return 0, 0, fmt.Errorf("unknown build stage %q", options.Step)
-		}
-		return index, index, nil
+func executionOrder(stages []Stage, options ExecuteOptions) ([]int, map[string]bool, error) {
+	selected := make(map[string]bool, len(stages))
+	if len(stages) == 0 {
+		return nil, selected, nil
 	}
+	if options.Step != "" {
+		index, err := resolveStageIndex(stages, options.Step)
+		if err != nil {
+			return nil, nil, err
+		}
+		selected[stages[index].Reference()] = true
+		return []int{index}, selected, nil
+	}
+
+	first, last := -1, -1
 	if options.From != "" {
-		first = stageIndex(stages, options.From)
-		if first < 0 {
-			return 0, 0, fmt.Errorf("unknown --from stage %q", options.From)
+		var err error
+		first, err = resolveStageIndex(stages, options.From)
+		if err != nil {
+			return nil, nil, fmt.Errorf("resolve --from: %w", err)
 		}
 	}
 	if options.Until != "" {
-		last = stageIndex(stages, options.Until)
-		if last < 0 {
-			return 0, 0, fmt.Errorf("unknown --until stage %q", options.Until)
+		var err error
+		last, err = resolveStageIndex(stages, options.Until)
+		if err != nil {
+			return nil, nil, fmt.Errorf("resolve --until: %w", err)
 		}
 	}
-	if first > last {
-		return 0, 0, fmt.Errorf("--from stage %q comes after --until stage %q", options.From, options.Until)
+	fromID, untilID := "", ""
+	if first >= 0 {
+		fromID = stages[first].Reference()
 	}
-	return first, last, nil
+	if last >= 0 {
+		untilID = stages[last].Reference()
+	}
+	if first >= 0 && last >= 0 && first != last && !stageDependsOn(stages[last], fromID, stages) {
+		if first > last {
+			return nil, nil, fmt.Errorf("--from stage %q comes after --until stage %q", fromID, untilID)
+		}
+		return nil, nil, fmt.Errorf(
+			"--from stage %q is not a dependency of --until stage %q",
+			fromID,
+			untilID,
+		)
+	}
+
+	for _, stage := range stages {
+		include := true
+		if first >= 0 {
+			include = stage.Reference() == fromID || stageDependsOn(stage, fromID, stages)
+		}
+		if include && last >= 0 {
+			include = stage.Reference() == untilID || stageDependsOn(stages[last], stage.Reference(), stages)
+		}
+		if include {
+			selected[stage.Reference()] = true
+		}
+	}
+	return topologicalStageIndexes(stages, selected), selected, nil
 }
 
-func stageIndex(stages []Stage, id string) int {
-	for index, stage := range stages {
-		if stage.ID == id {
-			return index
+func topologicalStageIndexes(stages []Stage, selected map[string]bool) []int {
+	completed := make(map[string]bool, len(selected))
+	result := make([]int, 0, len(selected))
+	for len(result) < len(selected) {
+		for index, stage := range stages {
+			if !selected[stage.Reference()] || completed[stage.Reference()] {
+				continue
+			}
+			ready := true
+			for _, dependency := range stage.Needs {
+				if selected[dependency] && !completed[dependency] {
+					ready = false
+					break
+				}
+			}
+			if ready {
+				completed[stage.Reference()] = true
+				result = append(result, index)
+			}
 		}
 	}
-	return -1
+	return result
+}
+
+func stageDependsOn(stage Stage, dependencyID string, stages []Stage) bool {
+	indexes := make(map[string]int, len(stages))
+	for index := range stages {
+		indexes[stages[index].Reference()] = index
+	}
+	return dependsOn(stage.Reference(), dependencyID, stages, indexes, make(map[string]bool))
+}
+
+func prerequisiteStages(stages []Stage, selected map[string]bool) []Stage {
+	indexes := make(map[string]int, len(stages))
+	for index := range stages {
+		indexes[stages[index].Reference()] = index
+	}
+	prerequisites := make(map[string]bool)
+	var visit func(string)
+	visit = func(id string) {
+		for _, dependency := range stages[indexes[id]].Needs {
+			if prerequisites[dependency] || selected[dependency] {
+				continue
+			}
+			prerequisites[dependency] = true
+			visit(dependency)
+		}
+	}
+	for id := range selected {
+		visit(id)
+	}
+
+	result := make([]Stage, 0, len(prerequisites))
+	for _, stage := range stages {
+		if prerequisites[stage.Reference()] {
+			result = append(result, stage)
+		}
+	}
+	return result
+}
+
+func resolveStageIndex(stages []Stage, selector string) (int, error) {
+	for index, stage := range stages {
+		if stage.Reference() == selector {
+			return index, nil
+		}
+	}
+	match := -1
+	var instances []string
+	for index, stage := range stages {
+		if stage.ID != selector {
+			continue
+		}
+		match = index
+		instances = append(instances, stage.Reference())
+	}
+	if len(instances) == 1 {
+		return match, nil
+	}
+	if len(instances) > 1 {
+		return -1, fmt.Errorf(
+			"build stage %q is ambiguous; select one of %s",
+			selector,
+			strings.Join(instances, ", "),
+		)
+	}
+	return -1, fmt.Errorf("unknown build stage %q", selector)
 }
 
 func collectArtifacts(stages []Stage) map[string]Artifact {
 	result := make(map[string]Artifact)
 	for _, stage := range stages {
-		for _, output := range stage.Outputs {
-			result[output.Name] = output
-		}
+		registerArtifacts(result, stage.Outputs)
+	}
+	return result
+}
+
+func cloneArtifacts(artifacts map[string]Artifact) map[string]Artifact {
+	result := make(map[string]Artifact, len(artifacts))
+	for reference, artifact := range artifacts {
+		result[reference] = artifact
 	}
 	return result
 }
@@ -273,7 +421,7 @@ func verifyInputs(root string, stage Stage) error {
 			continue
 		}
 		if _, err := os.Stat(resolvePath(root, input.Path)); err != nil {
-			return fmt.Errorf("stage %s requires artifact %q at %s: %w", stage.ID, input.Name, input.Path, err)
+			return fmt.Errorf("stage %s requires artifact %q at %s: %w", stage.Reference(), input.Name, input.Path, err)
 		}
 	}
 	return nil
@@ -285,7 +433,7 @@ func verifyOutputs(root string, stage Stage) error {
 			continue
 		}
 		if _, err := os.Stat(resolvePath(root, output.Path)); err != nil {
-			return fmt.Errorf("stage %s did not produce artifact %q at %s: %w", stage.ID, output.Name, output.Path, err)
+			return fmt.Errorf("stage %s did not produce artifact %q at %s: %w", stage.Reference(), output.Name, output.Path, err)
 		}
 	}
 	return nil
@@ -357,7 +505,7 @@ func executeCommand(
 		return err
 	}
 	cmd.Env = append(os.Environ(),
-		"WAILS_BUILD_STAGE="+stageContext.Stage.ID,
+		"WAILS_BUILD_STAGE="+stageContext.Stage.Reference(),
 		"WAILS_BUILD_CONTEXT="+contextPath,
 	)
 	for name, value := range environment {
@@ -374,7 +522,7 @@ func writeContext(stageContext *StageContext) (string, error) {
 	if err := os.MkdirAll(directory, 0o755); err != nil {
 		return "", fmt.Errorf("create hook context directory: %w", err)
 	}
-	path := filepath.Join(directory, strings.ReplaceAll(stageContext.Stage.ID, ".", "-")+".json")
+	path := filepath.Join(directory, SafeInstanceName(stageContext.Stage.Reference())+".json")
 	payload := struct {
 		Stage     Stage               `json:"stage"`
 		Target    Target              `json:"target"`
@@ -400,6 +548,10 @@ func expand(value string, stageContext *StageContext) string {
 		"${target.platform}": stageContext.Plan.Target.Platform,
 		"${target.arch}":     stageContext.Plan.Target.Arch,
 	}
+	if stageContext.Stage.Target != nil {
+		replacements["${target.platform}"] = stageContext.Stage.Target.Platform
+		replacements["${target.arch}"] = stageContext.Stage.Target.Arch
+	}
 	for name, artifact := range stageContext.Artifacts {
 		replacements["${artifacts."+name+"}"] = resolvePath(stageContext.Plan.Project.Root, artifact.Path)
 	}
@@ -407,6 +559,12 @@ func expand(value string, stageContext *StageContext) string {
 		value = strings.ReplaceAll(value, from, to)
 	}
 	return value
+}
+
+// SafeInstanceName converts a qualified stage instance to a portable filename.
+func SafeInstanceName(instance string) string {
+	replacer := strings.NewReplacer(".", "-", "[", "-", "]", "", "/", "-")
+	return replacer.Replace(instance)
 }
 
 func resolvePath(root, path string) string {
