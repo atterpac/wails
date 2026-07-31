@@ -14,15 +14,18 @@ import (
 )
 
 type StageFunc func(context.Context, *StageContext) error
+type ActionFunc func(context.Context, *StageContext, Action) error
 
 type ExecuteOptions struct {
-	From     string
-	Until    string
-	Step     string
-	Stdout   io.Writer
-	Stderr   io.Writer
-	Builtins map[string]StageFunc
-	OnStage  func(Stage, string)
+	From            string
+	Until           string
+	Step            string
+	Stdout          io.Writer
+	Stderr          io.Writer
+	Builtins        map[string]StageFunc
+	InternalActions map[string]ActionFunc
+	OnStage         func(Stage, string)
+	OnAction        func(Stage, Action, string)
 }
 
 type StageContext struct {
@@ -82,6 +85,10 @@ func Execute(ctx context.Context, plan *Plan, options ExecuteOptions) error {
 			); err != nil {
 				return fmt.Errorf("stage %s replacement: %w", stage.ID, err)
 			}
+		} else if len(stage.Actions) > 0 {
+			if err := executeActions(ctx, stageContext, options); err != nil {
+				return fmt.Errorf("stage %s: %w", stage.ID, err)
+			}
 		} else {
 			implementation := options.Builtins[stage.ID]
 			if implementation == nil {
@@ -103,6 +110,115 @@ func Execute(ctx context.Context, plan *Plan, options ExecuteOptions) error {
 		notifyStage(options, stage, "completed")
 	}
 	return nil
+}
+
+func executeActions(ctx context.Context, stageContext *StageContext, options ExecuteOptions) error {
+	actions := stageContext.Stage.Actions
+	for index, action := range actions {
+		if action.Status == "skipped" {
+			notifyAction(options, stageContext.Stage, action, "skipped")
+			continue
+		}
+		notifyAction(options, stageContext.Stage, action, "running")
+		if err := executeAction(ctx, stageContext, action, options.InternalActions); err != nil {
+			cleanupErr := executeFinalActions(ctx, stageContext, options, actions[index+1:])
+			return errors.Join(err, cleanupErr)
+		}
+		notifyAction(options, stageContext.Stage, action, "completed")
+	}
+	return nil
+}
+
+func executeFinalActions(
+	ctx context.Context,
+	stageContext *StageContext,
+	options ExecuteOptions,
+	actions []Action,
+) error {
+	var result error
+	for _, action := range actions {
+		if !action.Finally || action.Status == "skipped" {
+			continue
+		}
+		notifyAction(options, stageContext.Stage, action, "running")
+		if err := executeAction(ctx, stageContext, action, options.InternalActions); err != nil {
+			result = errors.Join(result, err)
+			continue
+		}
+		notifyAction(options, stageContext.Stage, action, "completed")
+	}
+	return result
+}
+
+func executeAction(
+	ctx context.Context,
+	stageContext *StageContext,
+	action Action,
+	internalActions map[string]ActionFunc,
+) error {
+	switch action.Kind {
+	case ActionCommand:
+		return executeCommand(
+			ctx,
+			stageContext,
+			action.Command,
+			action.WorkingDirectory,
+			action.Environment,
+			action.Timeout,
+		)
+	case ActionCheckTool:
+		if _, err := exec.LookPath(action.Tool); err != nil {
+			return fmt.Errorf("required tool %q was not found in PATH", action.Tool)
+		}
+		return nil
+	case ActionCopy:
+		return copyFile(
+			expand(action.Source, stageContext),
+			expand(action.Destination, stageContext),
+		)
+	case ActionInternal:
+		implementation := internalActions[action.Internal]
+		if implementation == nil {
+			return fmt.Errorf("internal action %q has no implementation", action.Internal)
+		}
+		return implementation(ctx, stageContext, action)
+	case ActionMkdir:
+		return os.MkdirAll(expand(action.Path, stageContext), 0o755)
+	case ActionRemove:
+		path := expand(action.Path, stageContext)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	case ActionVerify:
+		path := expand(action.Path, stageContext)
+		if _, err := os.Stat(path); err != nil {
+			return fmt.Errorf("verify %s: %w", path, err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported action kind %q", action.Kind)
+	}
+}
+
+func copyFile(source, destination string) error {
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+		return err
+	}
+	output, err := os.Create(destination)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(output, input); err != nil {
+		output.Close()
+		return err
+	}
+	return output.Close()
 }
 
 func executionRange(stages []Stage, options ExecuteOptions) (int, int, error) {
@@ -303,5 +419,11 @@ func resolvePath(root, path string) string {
 func notifyStage(options ExecuteOptions, stage Stage, status string) {
 	if options.OnStage != nil {
 		options.OnStage(stage, status)
+	}
+}
+
+func notifyAction(options ExecuteOptions, stage Stage, action Action, status string) {
+	if options.OnAction != nil {
+		options.OnAction(stage, action, status)
 	}
 }

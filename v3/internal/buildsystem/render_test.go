@@ -41,6 +41,17 @@ func TestStageInspectionRenderers(t *testing.T) {
 
 	inspection, err := InspectStage(plan, "native.compile")
 	require.NoError(t, err)
+	inspection.Stage.Actions = []Action{{
+		Kind:             ActionCommand,
+		Description:      "Compile application",
+		Status:           "planned",
+		Command:          []string{"go", "build", "-ldflags=-w -s"},
+		WorkingDirectory: inspection.Project.Root,
+		Environment: map[string]string{
+			"GOARCH": "amd64",
+			"GOOS":   "linux",
+		},
+	}}
 	assert.Equal(t, "native.compile", inspection.Stage.ID)
 	assert.Equal(t, plan.Target, inspection.Target)
 
@@ -50,12 +61,16 @@ func TestStageInspectionRenderers(t *testing.T) {
 	require.NoError(t, json.Unmarshal(jsonOutput.Bytes(), &decoded))
 	assert.Equal(t, "native.compile", decoded.Stage.ID)
 	assert.Equal(t, []string{"frontend.build", "platform.generate"}, decoded.Stage.Needs)
+	assert.Equal(t, inspection.Stage.Actions, decoded.Stage.Actions)
 
 	var textOutput bytes.Buffer
 	require.NoError(t, WriteStageText(&textOutput, inspection))
 	assert.Contains(t, textOutput.String(), "Build step:     native.compile")
 	assert.Contains(t, textOutput.String(), "Implementation: wails/native.compile")
 	assert.Contains(t, textOutput.String(), "Needs:          frontend.build, platform.generate")
+	assert.Contains(t, textOutput.String(), "Execution:")
+	assert.Contains(t, textOutput.String(), `"go" "build" "-ldflags=-w -s"`)
+	assert.Contains(t, textOutput.String(), "GOARCH=amd64")
 	assert.Contains(t, textOutput.String(), "frontend (frontend-distribution): frontend/dist")
 	assert.Contains(t, textOutput.String(), "binary (native-binary): bin/")
 

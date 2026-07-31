@@ -61,6 +61,7 @@ type Stage struct {
 	Reason         string     `json:"reason,omitempty"`
 	Inputs         []Artifact `json:"inputs,omitempty"`
 	Outputs        []Artifact `json:"outputs,omitempty"`
+	Actions        []Action   `json:"actions,omitempty"`
 	Before         []Hook     `json:"before,omitempty"`
 	After          []Hook     `json:"after,omitempty"`
 	Replacement    *Command   `json:"replacement,omitempty"`
@@ -70,6 +71,38 @@ type Artifact struct {
 	Name string `json:"name"`
 	Type string `json:"type"`
 	Path string `json:"path,omitempty"`
+}
+
+type ActionKind string
+
+const (
+	ActionCommand   ActionKind = "command"
+	ActionCheckTool ActionKind = "check-tool"
+	ActionCopy      ActionKind = "copy"
+	ActionInternal  ActionKind = "internal"
+	ActionMkdir     ActionKind = "mkdir"
+	ActionRemove    ActionKind = "remove"
+	ActionVerify    ActionKind = "verify"
+)
+
+// Action is a resolved, executable operation within a public build stage.
+// Actions are inspectable implementation details, not stable extension IDs.
+type Action struct {
+	Kind             ActionKind        `json:"kind"`
+	Description      string            `json:"description,omitempty"`
+	Status           string            `json:"status,omitempty"`
+	Reason           string            `json:"reason,omitempty"`
+	Finally          bool              `json:"finally,omitempty"`
+	Command          []string          `json:"command,omitempty"`
+	WorkingDirectory string            `json:"workingDirectory,omitempty"`
+	Environment      map[string]string `json:"environment,omitempty"`
+	Timeout          string            `json:"timeout,omitempty"`
+	Source           string            `json:"source,omitempty"`
+	Destination      string            `json:"destination,omitempty"`
+	Path             string            `json:"path,omitempty"`
+	Internal         string            `json:"internal,omitempty"`
+	Tool             string            `json:"tool,omitempty"`
+	Parameters       map[string]string `json:"parameters,omitempty"`
 }
 
 type Hook struct {

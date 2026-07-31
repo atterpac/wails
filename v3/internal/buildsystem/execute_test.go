@@ -96,6 +96,63 @@ func TestExecuteRunsReplacementAndExpandsArtifactPath(t *testing.T) {
 	assert.FileExists(t, filepath.Join(root, "dist", "custom"))
 }
 
+func TestExecuteRunsResolvedActions(t *testing.T) {
+	root := t.TempDir()
+	actions := []Action{
+		{
+			Kind:        ActionMkdir,
+			Description: "Create action workspace",
+			Path:        "${project.root}/work",
+		},
+		{
+			Kind:        ActionCommand,
+			Description: "Generate source file",
+			Command:     []string{os.Args[0], "-test.run=TestBuildsystemHelperProcess", "--"},
+			Environment: map[string]string{
+				"GO_WANT_BUILDSYSTEM_HELPER": "1",
+				"TARGET_FILE":                "${project.root}/work/source",
+			},
+		},
+		{
+			Kind:        ActionCopy,
+			Description: "Copy generated file",
+			Source:      "${project.root}/work/source",
+			Destination: "${project.root}/work/result",
+		},
+		{
+			Kind:        ActionVerify,
+			Description: "Verify copied file",
+			Path:        "${project.root}/work/result",
+		},
+		{
+			Kind:        ActionRemove,
+			Description: "Remove temporary source",
+			Path:        "${project.root}/work/source",
+		},
+	}
+	plan := &Plan{
+		Project: Project{Root: root},
+		Stages: []Stage{{
+			ID:      "native.compile",
+			Status:  "planned",
+			Actions: actions,
+			Outputs: []Artifact{{Name: "binary", Path: "work/result"}},
+		}},
+	}
+
+	var executed []Action
+	require.NoError(t, Execute(context.Background(), plan, ExecuteOptions{
+		OnAction: func(_ Stage, action Action, status string) {
+			if status == "completed" {
+				executed = append(executed, action)
+			}
+		},
+	}))
+	assert.Equal(t, actions, executed)
+	assert.FileExists(t, filepath.Join(root, "work", "result"))
+	assert.NoFileExists(t, filepath.Join(root, "work", "source"))
+}
+
 func TestExecuteRejectsInvalidRange(t *testing.T) {
 	plan := &Plan{Stages: []Stage{
 		{ID: "one"},
@@ -128,9 +185,64 @@ func TestExecuteReportsMissingOutput(t *testing.T) {
 	require.ErrorContains(t, err, `stage native.compile did not produce artifact "binary"`)
 }
 
+func TestExecuteRunsFinallyActionsAfterFailure(t *testing.T) {
+	root := t.TempDir()
+	temporary := filepath.Join(root, "temporary.syso")
+	require.NoError(t, os.WriteFile(temporary, []byte("temporary"), 0o644))
+	plan := &Plan{
+		Project: Project{Root: root},
+		Stages: []Stage{{
+			ID:     "native.compile",
+			Status: "planned",
+			Actions: []Action{
+				{
+					Kind:    ActionCommand,
+					Command: []string{os.Args[0], "-test.run=TestBuildsystemHelperProcess", "--"},
+					Environment: map[string]string{
+						"GO_WANT_BUILDSYSTEM_HELPER": "1",
+						"HELPER_FAIL":                "1",
+					},
+				},
+				{
+					Kind:    ActionRemove,
+					Path:    temporary,
+					Finally: true,
+				},
+			},
+		}},
+	}
+
+	err := Execute(context.Background(), plan, ExecuteOptions{})
+	require.Error(t, err)
+	assert.NoFileExists(t, temporary)
+}
+
+func TestExecuteChecksRequiredTools(t *testing.T) {
+	root := t.TempDir()
+	plan := &Plan{
+		Project: Project{Root: root},
+		Stages: []Stage{{
+			ID:     "toolchain.check",
+			Status: "planned",
+			Actions: []Action{{
+				Kind: ActionCheckTool,
+				Tool: os.Args[0],
+			}},
+		}},
+	}
+	require.NoError(t, Execute(context.Background(), plan, ExecuteOptions{}))
+
+	plan.Stages[0].Actions[0].Tool = "wails-buildsystem-definitely-missing-tool"
+	err := Execute(context.Background(), plan, ExecuteOptions{})
+	require.EqualError(t, err, `stage toolchain.check: required tool "wails-buildsystem-definitely-missing-tool" was not found in PATH`)
+}
+
 func TestBuildsystemHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_BUILDSYSTEM_HELPER") != "1" {
 		return
+	}
+	if os.Getenv("HELPER_FAIL") == "1" {
+		os.Exit(4)
 	}
 	path := os.Getenv("TARGET_FILE")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

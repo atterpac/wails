@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -113,6 +115,14 @@ func WriteStageText(writer io.Writer, inspection *StageInspection) error {
 			}
 		}
 	}
+	if len(stage.Actions) > 0 {
+		if _, err := fmt.Fprintln(writer, "\nExecution:"); err != nil {
+			return err
+		}
+		if err := writeActions(writer, stage.Actions); err != nil {
+			return err
+		}
+	}
 	if len(stage.After) > 0 {
 		if _, err := fmt.Fprintln(writer, "\nAfter hooks:"); err != nil {
 			return err
@@ -138,6 +148,108 @@ func WriteStageText(writer io.Writer, inspection *StageInspection) error {
 		}
 	}
 	return nil
+}
+
+func writeActions(writer io.Writer, actions []Action) error {
+	for index, action := range actions {
+		status := action.Status
+		if status == "" {
+			status = "planned"
+		}
+		if _, err := fmt.Fprintf(writer, "  %d. %s [%s]", index+1, action.Kind, status); err != nil {
+			return err
+		}
+		if action.Description != "" {
+			if _, err := fmt.Fprintf(writer, " %s", action.Description); err != nil {
+				return err
+			}
+		}
+		if action.Finally {
+			if _, err := fmt.Fprint(writer, " [finally]"); err != nil {
+				return err
+			}
+		}
+		if action.Reason != "" {
+			if _, err := fmt.Fprintf(writer, " (%s)", action.Reason); err != nil {
+				return err
+			}
+		}
+		if _, err := fmt.Fprintln(writer); err != nil {
+			return err
+		}
+
+		switch action.Kind {
+		case ActionCommand:
+			if _, err := fmt.Fprintf(writer, "     command: %s\n", formatCommand(action.Command)); err != nil {
+				return err
+			}
+		case ActionCheckTool:
+			if _, err := fmt.Fprintf(writer, "     tool: %s\n", action.Tool); err != nil {
+				return err
+			}
+		case ActionCopy:
+			if _, err := fmt.Fprintf(writer, "     from: %s\n     to:   %s\n", action.Source, action.Destination); err != nil {
+				return err
+			}
+		case ActionInternal:
+			if _, err := fmt.Fprintf(writer, "     operation: %s\n", action.Internal); err != nil {
+				return err
+			}
+		case ActionMkdir, ActionRemove, ActionVerify:
+			if _, err := fmt.Fprintf(writer, "     path: %s\n", action.Path); err != nil {
+				return err
+			}
+		}
+		if len(action.Parameters) > 0 {
+			if _, err := fmt.Fprintln(writer, "     parameters:"); err != nil {
+				return err
+			}
+			names := make([]string, 0, len(action.Parameters))
+			for name := range action.Parameters {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				if _, err := fmt.Fprintf(writer, "       %s=%s\n", name, action.Parameters[name]); err != nil {
+					return err
+				}
+			}
+		}
+		if action.WorkingDirectory != "" {
+			if _, err := fmt.Fprintf(writer, "     directory: %s\n", action.WorkingDirectory); err != nil {
+				return err
+			}
+		}
+		if len(action.Environment) > 0 {
+			if _, err := fmt.Fprintln(writer, "     environment:"); err != nil {
+				return err
+			}
+			names := make([]string, 0, len(action.Environment))
+			for name := range action.Environment {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				if _, err := fmt.Fprintf(writer, "       %s=%s\n", name, action.Environment[name]); err != nil {
+					return err
+				}
+			}
+		}
+		if action.Timeout != "" {
+			if _, err := fmt.Fprintf(writer, "     timeout: %s\n", action.Timeout); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func formatCommand(command []string) string {
+	quoted := make([]string, len(command))
+	for index, argument := range command {
+		quoted[index] = strconv.Quote(argument)
+	}
+	return strings.Join(quoted, " ")
 }
 
 func writeHooks(writer io.Writer, hooks []Hook) error {
