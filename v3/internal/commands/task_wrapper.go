@@ -106,8 +106,13 @@ func buildStepInvocation(args []string) (string, []string, error) {
 
 func printBuildPlan(buildFlags *flags.Build, otherArgs []string, step string) error {
 	target, arch := targetFromArgs(otherArgs)
+	targets, err := requestedTargets(buildFlags.Targets)
+	if err != nil {
+		return err
+	}
 	plan, err := buildsystem.Resolve(buildsystem.Request{
 		ConfigPath: buildFlags.Config,
+		Targets:    targets,
 		Target:     target,
 		Arch:       arch,
 		Mode:       "production",
@@ -135,6 +140,21 @@ func printBuildPlan(buildFlags *flags.Build, otherArgs []string, step string) er
 		return buildsystem.WriteJSON(os.Stdout, plan)
 	}
 	return buildsystem.WriteText(os.Stdout, plan)
+}
+
+func requestedTargets(values []string) ([]buildsystem.Target, error) {
+	result := make([]buildsystem.Target, 0, len(values))
+	for _, value := range values {
+		parts := strings.Split(value, "/")
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+			return nil, fmt.Errorf("invalid build target %q; expected platform/architecture", value)
+		}
+		result = append(result, buildsystem.Target{
+			Platform: strings.TrimSpace(parts[0]),
+			Arch:     strings.TrimSpace(parts[1]),
+		})
+	}
+	return result, nil
 }
 
 func targetFromArgs(args []string) (string, string) {

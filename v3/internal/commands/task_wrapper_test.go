@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/wailsapp/wails/v3/internal/buildsystem"
 	"github.com/wailsapp/wails/v3/internal/flags"
 )
 
@@ -545,4 +547,16 @@ func TestSignWrapperCommand(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, currentOS+":sign", capturedOptions.Name)
 	assert.Equal(t, []string{"IDENTITY=Developer ID", "GOOS=" + currentOS, "ARCH=" + currentArch}, capturedOtherArgs)
+}
+
+func TestRequestedTargets(t *testing.T) {
+	targets, err := requestedTargets([]string{"windows/amd64", "linux/arm64"})
+	require.NoError(t, err)
+	assert.Equal(t, []buildsystem.Target{
+		{Platform: "windows", Arch: "amd64"},
+		{Platform: "linux", Arch: "arm64"},
+	}, targets)
+
+	_, err = requestedTargets([]string{"windows"})
+	require.EqualError(t, err, `invalid build target "windows"; expected platform/architecture`)
 }

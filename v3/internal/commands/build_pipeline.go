@@ -21,8 +21,13 @@ import (
 
 func executeBuildPipeline(buildFlags *flags.Build, otherArgs []string, step string) error {
 	target, arch := targetFromArgs(otherArgs)
+	targets, err := requestedTargets(buildFlags.Targets)
+	if err != nil {
+		return err
+	}
 	plan, err := buildsystem.Resolve(buildsystem.Request{
 		ConfigPath: buildFlags.Config,
+		Targets:    targets,
 		Target:     target,
 		Arch:       arch,
 		Mode:       "production",
@@ -48,11 +53,11 @@ func executeBuildPipeline(buildFlags *flags.Build, otherArgs []string, step stri
 		OnStage: func(stage buildsystem.Stage, status string) {
 			switch status {
 			case "running":
-				term.Infof("%s", stage.ID)
+				term.Infof("%s", stage.Reference())
 			case "completed":
-				term.Success(stage.ID)
+				term.Success(stage.Reference())
 			case "skipped":
-				term.Infof("%s (skipped: %s)", stage.ID, stage.Reason)
+				term.Infof("%s (skipped: %s)", stage.Reference(), stage.Reason)
 			}
 		},
 	})
@@ -74,7 +79,7 @@ func resolveBuildActions(plan *buildsystem.Plan, buildFlags *flags.Build) error 
 				Path:        filepath.Join(plan.Project.Root, ".wails", "build"),
 			}}
 		case "toolchain.check":
-			stage.Actions = toolchainActions(plan)
+			stage.Actions = toolchainActions(plan, *stage)
 		case "dependencies.prepare":
 			stage.Actions = dependencyActions(plan)
 		case "bindings.generate":
@@ -86,7 +91,7 @@ func resolveBuildActions(plan *buildsystem.Plan, buildFlags *flags.Build) error 
 				"bindings.generate",
 				"Generate frontend bindings from the application Go packages",
 				map[string]string{
-					"buildFlags": "-tags " + strings.Join(plan.Target.Tags, ","),
+					"buildFlags": "-tags " + strings.Join(planTags(plan), ","),
 					"clean":      "true",
 					"index":      "index",
 					"models":     "models",
@@ -128,19 +133,19 @@ func resolveBuildActions(plan *buildsystem.Plan, buildFlags *flags.Build) error 
 			}
 			stage.Actions = actions
 		case "artifacts.collect":
-			binary, err := planArtifactPath(plan, "binary")
-			if err != nil {
-				return err
-			}
 			manifest, err := planStageOutputPath(plan, *stage, "manifest")
 			if err != nil {
 				return err
 			}
+			binaries, err := json.Marshal(collectionInputs(plan, stage.Inputs))
+			if err != nil {
+				return fmt.Errorf("encode artifact collection inputs: %w", err)
+			}
 			stage.Actions = []buildsystem.Action{internalBuildActionWithParameters(
 				"artifacts.collect",
-				"Hash the native binary and write the artifact manifest",
+				"Hash native binaries and write the artifact manifest",
 				map[string]string{
-					"binary":   binary,
+					"binaries": string(binaries),
 					"manifest": manifest,
 				},
 			)}
@@ -150,12 +155,16 @@ func resolveBuildActions(plan *buildsystem.Plan, buildFlags *flags.Build) error 
 	return nil
 }
 
-func toolchainActions(plan *buildsystem.Plan) []buildsystem.Action {
+func toolchainActions(plan *buildsystem.Plan, stage buildsystem.Stage) []buildsystem.Action {
+	target := stage.Target
+	if target == nil {
+		return nil
+	}
 	tools := []string{"go"}
 	if fileExists(filepath.Join(plan.Project.Root, plan.Project.Frontend, "package.json")) {
 		tools = append(tools, plan.Project.PackageManager)
 	}
-	if plan.Target.Platform == "linux" || plan.Target.Platform == "darwin" {
+	if target.Platform == "linux" || target.Platform == "darwin" {
 		tools = append(tools, "cc")
 	}
 	actions := make([]buildsystem.Action, 0, len(tools)+1)
@@ -167,7 +176,7 @@ func toolchainActions(plan *buildsystem.Plan) []buildsystem.Action {
 			Tool:        tool,
 		})
 	}
-	if plan.Target.Platform == "linux" && runtime.GOOS == "linux" {
+	if target.Platform == "linux" && runtime.GOOS == "linux" {
 		actions = append(actions, buildsystem.Action{
 			Kind:             buildsystem.ActionCommand,
 			Description:      "Check Linux GUI development packages",
@@ -180,6 +189,9 @@ func toolchainActions(plan *buildsystem.Plan) []buildsystem.Action {
 }
 
 func assetActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]buildsystem.Action, error) {
+	if stage.Target == nil {
+		return nil, fmt.Errorf("stage %s has no target", stage.Reference())
+	}
 	output, err := planStageOutputPath(plan, stage, "assets")
 	if err != nil {
 		return nil, err
@@ -191,7 +203,7 @@ func assetActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]buildsyste
 		Status:      "planned",
 		Path:        output,
 	}}
-	switch plan.Target.Platform {
+	switch stage.Target.Platform {
 	case "windows":
 		return append(actions, internalBuildActionWithParameters(
 			"assets.generate-icons",
@@ -225,6 +237,9 @@ func assetActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]buildsyste
 }
 
 func platformActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]buildsystem.Action, error) {
+	if stage.Target == nil {
+		return nil, fmt.Errorf("stage %s has no target", stage.Reference())
+	}
 	output, err := planStageOutputPath(plan, stage, "platform")
 	if err != nil {
 		return nil, err
@@ -235,9 +250,9 @@ func platformActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]buildsy
 		Status:      "planned",
 		Path:        output,
 	}}
-	switch plan.Target.Platform {
+	switch stage.Target.Platform {
 	case "windows":
-		assets, err := planArtifactPath(plan, "assets")
+		assets, err := stageInputPath(plan, stage, "assets")
 		if err != nil {
 			return nil, err
 		}
@@ -245,15 +260,15 @@ func platformActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]buildsy
 			"platform.generate-syso",
 			"Generate the Windows resource object",
 			map[string]string{
-				"arch":     plan.Target.Arch,
+				"arch":     stage.Target.Arch,
 				"icon":     filepath.Join(assets, "icon.ico"),
 				"info":     filepath.Join(plan.Project.Root, "build", "windows", "info.json"),
 				"manifest": filepath.Join(plan.Project.Root, "build", "windows", "wails.exe.manifest"),
-				"output":   filepath.Join(output, "rsrc_windows_"+plan.Target.Arch+".syso"),
+				"output":   filepath.Join(output, "rsrc_windows_"+stage.Target.Arch+".syso"),
 			},
 		)), nil
 	case "darwin":
-		assets, err := planArtifactPath(plan, "assets")
+		assets, err := stageInputPath(plan, stage, "assets")
 		if err != nil {
 			return nil, err
 		}
@@ -286,7 +301,7 @@ func addActionContextEnvironment(plan *buildsystem.Plan) {
 			".wails",
 			"build",
 			"context",
-			strings.ReplaceAll(stage.ID, ".", "-")+".json",
+			buildsystem.SafeInstanceName(stage.Reference())+".json",
 		)
 		for actionIndex := range stage.Actions {
 			action := &stage.Actions[actionIndex]
@@ -296,7 +311,7 @@ func addActionContextEnvironment(plan *buildsystem.Plan) {
 			if action.Environment == nil {
 				action.Environment = make(map[string]string)
 			}
-			action.Environment["WAILS_BUILD_STAGE"] = stage.ID
+			action.Environment["WAILS_BUILD_STAGE"] = stage.Reference()
 			action.Environment["WAILS_BUILD_CONTEXT"] = contextPath
 		}
 	}
@@ -335,6 +350,9 @@ func nativeCompileActions(
 	stage buildsystem.Stage,
 	buildFlags *flags.Build,
 ) ([]buildsystem.Action, error) {
+	if stage.Target == nil {
+		return nil, fmt.Errorf("stage %s has no target", stage.Reference())
+	}
 	if buildFlags.Obfuscated {
 		return []buildsystem.Action{internalBuildAction(
 			"native.compile",
@@ -354,12 +372,12 @@ func nativeCompileActions(
 	}}
 
 	var temporaryResource string
-	if plan.Target.Platform == "windows" {
-		platform, err := planArtifactPath(plan, "platform")
+	if stage.Target.Platform == "windows" {
+		platform, err := stageInputPath(plan, stage, "platform")
 		if err != nil {
 			return nil, err
 		}
-		name := "rsrc_windows_" + plan.Target.Arch + ".syso"
+		name := "rsrc_windows_" + stage.Target.Arch + ".syso"
 		temporaryResource = filepath.Join(plan.Project.Root, name)
 		actions = append(actions, buildsystem.Action{
 			Kind:        buildsystem.ActionCopy,
@@ -371,20 +389,20 @@ func nativeCompileActions(
 	}
 
 	command := []string{"go", "build"}
-	if len(plan.Target.Tags) > 0 {
-		command = append(command, "-tags", strings.Join(plan.Target.Tags, ","))
+	if len(stage.Target.Tags) > 0 {
+		command = append(command, "-tags", strings.Join(stage.Target.Tags, ","))
 	}
 	command = append(command, "-trimpath", "-buildvcs=false", "-ldflags=-w -s", "-o", output)
 	environment := map[string]string{
-		"GOOS":   plan.Target.Platform,
-		"GOARCH": plan.Target.Arch,
+		"GOOS":   stage.Target.Platform,
+		"GOARCH": stage.Target.Arch,
 	}
-	if slices.Contains([]string{"linux", "darwin"}, plan.Target.Platform) {
+	if slices.Contains([]string{"linux", "darwin"}, stage.Target.Platform) {
 		environment["CGO_ENABLED"] = "1"
 	} else {
 		environment["CGO_ENABLED"] = "0"
 	}
-	if plan.Target.Platform == "darwin" {
+	if stage.Target.Platform == "darwin" {
 		environment["CGO_CFLAGS"] = "-mmacosx-version-min=12.0"
 		environment["CGO_LDFLAGS"] = "-mmacosx-version-min=12.0"
 		environment["MACOSX_DEPLOYMENT_TARGET"] = "12.0"
@@ -436,15 +454,25 @@ func planStageOutputPath(plan *buildsystem.Plan, stage buildsystem.Stage, name s
 	return "", fmt.Errorf("stage %s has no output artifact %q", stage.ID, name)
 }
 
-func planArtifactPath(plan *buildsystem.Plan, name string) (string, error) {
-	for _, stage := range plan.Stages {
-		for _, artifact := range stage.Outputs {
-			if artifact.Name == name {
-				return absoluteArtifactPath(plan.Project.Root, artifact), nil
+func stageInputPath(plan *buildsystem.Plan, stage buildsystem.Stage, name string) (string, error) {
+	for _, artifact := range stage.Inputs {
+		if artifact.Name == name {
+			return absoluteArtifactPath(plan.Project.Root, artifact), nil
+		}
+	}
+	return "", fmt.Errorf("stage %s has no input artifact %q", stage.Reference(), name)
+}
+
+func planTags(plan *buildsystem.Plan) []string {
+	var tags []string
+	for _, target := range plan.Targets {
+		for _, tag := range target.Tags {
+			if !slices.Contains(tags, tag) {
+				tags = append(tags, tag)
 			}
 		}
 	}
-	return "", fmt.Errorf("build plan has no artifact %q", name)
+	return tags
 }
 
 func buildInternalActions(_ *flags.Build) map[string]buildsystem.ActionFunc {
@@ -574,41 +602,78 @@ type buildArtifactEntry struct {
 	SHA256   string `json:"sha256"`
 }
 
+type collectionInput struct {
+	ID         string `json:"id"`
+	Type       string `json:"type"`
+	Path       string `json:"path"`
+	ReportPath string `json:"reportPath"`
+	Platform   string `json:"platform"`
+	Arch       string `json:"arch"`
+}
+
+func collectionInputs(plan *buildsystem.Plan, artifacts []buildsystem.Artifact) []collectionInput {
+	result := make([]collectionInput, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		input := collectionInput{
+			ID:         artifact.Reference(),
+			Type:       artifact.Type,
+			Path:       absoluteArtifactPath(plan.Project.Root, artifact),
+			ReportPath: artifact.Path,
+		}
+		if artifact.Target != nil {
+			input.Platform = artifact.Target.Platform
+			input.Arch = artifact.Target.Arch
+		}
+		result = append(result, input)
+	}
+	return result
+}
+
 func collectArtifactsAction(
 	_ context.Context,
 	stage *buildsystem.StageContext,
 	action buildsystem.Action,
 ) error {
-	binaryArtifact, ok := stage.Artifacts["binary"]
-	if !ok {
-		return fmt.Errorf("artifact %q is not available to stage %s", "binary", stage.Stage.ID)
+	var inputs []collectionInput
+	if err := json.Unmarshal([]byte(action.Parameters["binaries"]), &inputs); err != nil {
+		return fmt.Errorf("decode artifact collection inputs: %w", err)
 	}
-	binary := action.Parameters["binary"]
-	info, err := os.Stat(binary)
-	if err != nil {
-		return err
-	}
-	file, err := os.Open(binary)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	hash := sha256.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return err
+	entries := make([]buildArtifactEntry, 0, len(inputs))
+	for _, input := range inputs {
+		if _, ok := stage.Artifacts[input.ID]; !ok {
+			return fmt.Errorf("artifact %q is not available to stage %s", input.ID, stage.Stage.Reference())
+		}
+		info, err := os.Stat(input.Path)
+		if err != nil {
+			return err
+		}
+		file, err := os.Open(input.Path)
+		if err != nil {
+			return err
+		}
+		hash := sha256.New()
+		_, copyErr := io.Copy(hash, file)
+		closeErr := file.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		entries = append(entries, buildArtifactEntry{
+			Type:     input.Type,
+			Platform: input.Platform,
+			Arch:     input.Arch,
+			Path:     input.ReportPath,
+			Size:     info.Size(),
+			SHA256:   hex.EncodeToString(hash.Sum(nil)),
+		})
 	}
 	manifestPath := action.Parameters["manifest"]
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o755); err != nil {
 		return err
 	}
-	payload := buildArtifactManifest{Artifacts: []buildArtifactEntry{{
-		Type:     "binary",
-		Platform: stage.Plan.Target.Platform,
-		Arch:     stage.Plan.Target.Arch,
-		Path:     binaryArtifact.Path,
-		Size:     info.Size(),
-		SHA256:   hex.EncodeToString(hash.Sum(nil)),
-	}}}
+	payload := buildArtifactManifest{Artifacts: entries}
 	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return err
