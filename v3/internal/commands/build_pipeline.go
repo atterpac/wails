@@ -47,6 +47,7 @@ func executeBuildPipeline(buildFlags *flags.Build, otherArgs []string, step stri
 		From:            buildFlags.From,
 		Until:           buildFlags.Until,
 		Step:            step,
+		Parallel:        buildFlags.Parallel,
 		Stdout:          os.Stdout,
 		Stderr:          os.Stderr,
 		InternalActions: buildInternalActions(buildFlags),

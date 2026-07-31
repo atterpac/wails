@@ -2,9 +2,12 @@ package buildsystem
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -166,6 +169,152 @@ func TestExecuteRejectsInvalidRange(t *testing.T) {
 	require.EqualError(t, err, `unknown build stage "missing"`)
 }
 
+func TestExecuteUsesDependencyOrderInsteadOfStorageOrder(t *testing.T) {
+	plan := &Plan{Stages: []Stage{
+		{ID: "collect", Needs: []string{"compile"}, Status: "planned"},
+		{ID: "compile", Needs: []string{"generate"}, Status: "planned"},
+		{ID: "generate", Status: "planned"},
+	}}
+	var executed []string
+
+	require.NoError(t, Execute(context.Background(), plan, ExecuteOptions{
+		Builtins: map[string]StageFunc{
+			"generate": func(context.Context, *StageContext) error { return nil },
+			"compile":  func(context.Context, *StageContext) error { return nil },
+			"collect":  func(context.Context, *StageContext) error { return nil },
+		},
+		OnStage: func(stage Stage, status string) {
+			if status == "completed" {
+				executed = append(executed, stage.ID)
+			}
+		},
+	}))
+	assert.Equal(t, []string{"generate", "compile", "collect"}, executed)
+}
+
+func TestExecuteParallelRunsIndependentStagesConcurrently(t *testing.T) {
+	plan := &Plan{Stages: []Stage{
+		{ID: "resolve", Status: "planned"},
+		{ID: "first", Needs: []string{"resolve"}, Status: "planned"},
+		{ID: "second", Needs: []string{"resolve"}, Status: "planned"},
+		{ID: "collect", Needs: []string{"first", "second"}, Status: "planned"},
+	}}
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var completed []string
+	done := make(chan error, 1)
+	go func() {
+		done <- Execute(context.Background(), plan, ExecuteOptions{
+			Parallel: true,
+			Builtins: map[string]StageFunc{
+				"resolve": func(context.Context, *StageContext) error { return nil },
+				"first": func(context.Context, *StageContext) error {
+					started <- "first"
+					<-release
+					return nil
+				},
+				"second": func(context.Context, *StageContext) error {
+					started <- "second"
+					<-release
+					return nil
+				},
+				"collect": func(context.Context, *StageContext) error { return nil },
+			},
+			OnStage: func(stage Stage, status string) {
+				if status == "completed" {
+					mu.Lock()
+					completed = append(completed, stage.Reference())
+					mu.Unlock()
+				}
+			},
+		})
+	}()
+
+	seen := map[string]bool{}
+	for range 2 {
+		select {
+		case stage := <-started:
+			seen[stage] = true
+		case <-time.After(time.Second):
+			t.Fatal("independent stages did not start concurrently")
+		}
+	}
+	close(release)
+	require.NoError(t, <-done)
+	assert.Equal(t, map[string]bool{"first": true, "second": true}, seen)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, "resolve", completed[0])
+	assert.Equal(t, "collect", completed[len(completed)-1])
+}
+
+func TestExecuteParallelCancelsSiblingsAfterFailure(t *testing.T) {
+	failure := errors.New("compile failed")
+	plan := &Plan{Stages: []Stage{
+		{ID: "fail", Status: "planned"},
+		{ID: "wait", Status: "planned"},
+		{ID: "downstream", Needs: []string{"wait"}, Status: "planned"},
+	}}
+	var started sync.WaitGroup
+	started.Add(2)
+	cancelled := make(chan struct{})
+	downstreamRan := false
+
+	err := Execute(context.Background(), plan, ExecuteOptions{
+		Parallel: true,
+		Builtins: map[string]StageFunc{
+			"fail": func(context.Context, *StageContext) error {
+				started.Done()
+				started.Wait()
+				return failure
+			},
+			"wait": func(ctx context.Context, _ *StageContext) error {
+				started.Done()
+				started.Wait()
+				<-ctx.Done()
+				close(cancelled)
+				return ctx.Err()
+			},
+			"downstream": func(context.Context, *StageContext) error {
+				downstreamRan = true
+				return nil
+			},
+		},
+	})
+	require.ErrorIs(t, err, failure)
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("sibling stage was not cancelled")
+	}
+	assert.False(t, downstreamRan)
+}
+
+func TestExecutionOrderUsesDependencyClosures(t *testing.T) {
+	stages := []Stage{
+		{ID: "resolve"},
+		{ID: "assets", Needs: []string{"resolve"}},
+		{ID: "bindings", Needs: []string{"resolve"}},
+		{ID: "compile", Needs: []string{"assets", "bindings"}},
+		{ID: "package", Needs: []string{"compile"}},
+		{ID: "unrelated", Needs: []string{"resolve"}},
+	}
+	require.NoError(t, Validate(&Plan{Stages: stages}))
+
+	order, _, err := executionOrder(stages, ExecuteOptions{Until: "compile"})
+	require.NoError(t, err)
+	assert.Equal(t, []int{0, 1, 2, 3}, order)
+
+	order, _, err = executionOrder(stages, ExecuteOptions{From: "compile"})
+	require.NoError(t, err)
+	assert.Equal(t, []int{3, 4}, order)
+
+	order, _, err = executionOrder(stages, ExecuteOptions{From: "assets", Until: "package"})
+	require.NoError(t, err)
+	assert.Equal(t, []int{1, 3, 4}, order)
+}
+
 func TestExecuteReportsMissingOutput(t *testing.T) {
 	root := t.TempDir()
 	plan := &Plan{
@@ -217,6 +366,25 @@ func TestExecuteRunsFinallyActionsAfterFailure(t *testing.T) {
 	assert.NoFileExists(t, temporary)
 }
 
+func TestFinalActionsRunWithoutCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cleanupRan := false
+	stage := &StageContext{Stage: Stage{ID: "cleanup"}}
+	err := executeFinalActions(ctx, stage, ExecuteOptions{
+		callbackMu: &sync.Mutex{},
+		InternalActions: map[string]ActionFunc{
+			"cleanup": func(ctx context.Context, _ *StageContext, _ Action) error {
+				require.NoError(t, ctx.Err())
+				cleanupRan = true
+				return nil
+			},
+		},
+	}, []Action{{Kind: ActionInternal, Internal: "cleanup", Finally: true}})
+	require.NoError(t, err)
+	assert.True(t, cleanupRan)
+}
+
 func TestExecuteChecksRequiredTools(t *testing.T) {
 	root := t.TempDir()
 	plan := &Plan{
@@ -235,6 +403,46 @@ func TestExecuteChecksRequiredTools(t *testing.T) {
 	plan.Stages[0].Actions[0].Tool = "wails-buildsystem-definitely-missing-tool"
 	err := Execute(context.Background(), plan, ExecuteOptions{})
 	require.EqualError(t, err, `stage toolchain.check: required tool "wails-buildsystem-definitely-missing-tool" was not found in PATH`)
+}
+
+func TestExecuteExpandsQualifiedArtifactReference(t *testing.T) {
+	root := t.TempDir()
+	target := &ArtifactTarget{Platform: "windows", Arch: "amd64"}
+	plan := &Plan{
+		Project: Project{Root: root},
+		Stages: []Stage{
+			{
+				ID:      "windows.compile",
+				Status:  "planned",
+				Outputs: []Artifact{{Name: "binary", Path: "bin/app.exe", Target: target}},
+			},
+			{
+				ID:     "report",
+				Needs:  []string{"windows.compile"},
+				Status: "planned",
+				Inputs: []Artifact{{Name: "binary", Path: "bin/app.exe", Target: target}},
+				Actions: []Action{{
+					Kind:    ActionCommand,
+					Command: []string{os.Args[0], "-test.run=TestBuildsystemHelperProcess", "--"},
+					Environment: map[string]string{
+						"GO_WANT_BUILDSYSTEM_HELPER": "1",
+						"TARGET_FILE":                "${artifacts.binary[windows/amd64]}.report",
+					},
+				}},
+			},
+		},
+	}
+
+	require.NoError(t, Execute(context.Background(), plan, ExecuteOptions{
+		Builtins: map[string]StageFunc{
+			"windows.compile": func(_ context.Context, stage *StageContext) error {
+				path := resolvePath(stage.Plan.Project.Root, stage.Stage.Outputs[0].Path)
+				require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+				return os.WriteFile(path, []byte("binary"), 0o755)
+			},
+		},
+	}))
+	assert.FileExists(t, filepath.Join(root, "bin", "app.exe.report"))
 }
 
 func TestBuildsystemHelperProcess(t *testing.T) {

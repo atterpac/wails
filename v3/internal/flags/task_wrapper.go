@@ -10,6 +10,7 @@ type Build struct {
 	Config     string   `name:"config" description:"Path to the build configuration" default:"build/config.yml"`
 	Targets    []string `name:"target" description:"Build target as platform/architecture (specify multiple times)"`
 	Pipeline   bool     `name:"pipeline" description:"Build with the typed Wails pipeline instead of compatibility Taskfiles"`
+	Parallel   bool     `name:"parallel" description:"Execute independent typed pipeline stages concurrently"`
 	From       string   `name:"from" description:"Start typed pipeline execution at this stage"`
 	Until      string   `name:"until" description:"Stop typed pipeline execution after this stage"`
 }

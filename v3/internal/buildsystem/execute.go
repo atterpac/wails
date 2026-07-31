@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,12 +21,14 @@ type ExecuteOptions struct {
 	From            string
 	Until           string
 	Step            string
+	Parallel        bool
 	Stdout          io.Writer
 	Stderr          io.Writer
 	Builtins        map[string]StageFunc
 	InternalActions map[string]ActionFunc
 	OnStage         func(Stage, string)
 	OnAction        func(Stage, Action, string)
+	callbackMu      *sync.Mutex
 }
 
 type StageContext struct {
@@ -34,6 +37,17 @@ type StageContext struct {
 	Artifacts map[string]Artifact
 	Stdout    io.Writer
 	Stderr    io.Writer
+}
+
+type synchronizedWriter struct {
+	mu     sync.Mutex
+	writer io.Writer
+}
+
+func (writer *synchronizedWriter) Write(data []byte) (int, error) {
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	return writer.writer.Write(data)
 }
 
 func Execute(ctx context.Context, plan *Plan, options ExecuteOptions) error {
@@ -49,11 +63,21 @@ func Execute(ctx context.Context, plan *Plan, options ExecuteOptions) error {
 	if options.Stderr == nil {
 		options.Stderr = os.Stderr
 	}
+	if options.callbackMu == nil {
+		options.callbackMu = &sync.Mutex{}
+	}
+	if options.Parallel {
+		options.Stdout = &synchronizedWriter{writer: options.Stdout}
+		options.Stderr = &synchronizedWriter{writer: options.Stderr}
+	}
 	order, selected, err := executionOrder(plan.Stages, options)
 	if err != nil {
 		return err
 	}
 	artifacts := collectArtifacts(prerequisiteStages(plan.Stages, selected))
+	if options.Parallel {
+		return executeParallel(ctx, plan, options, selected, artifacts)
+	}
 	return executeSequential(ctx, plan, options, order, artifacts)
 }
 
@@ -162,6 +186,7 @@ func executeFinalActions(
 	options ExecuteOptions,
 	actions []Action,
 ) error {
+	ctx = context.WithoutCancel(ctx)
 	var result error
 	for _, action := range actions {
 		if !action.Finally || action.Status == "skipped" {
@@ -577,12 +602,16 @@ func resolvePath(root, path string) string {
 
 func notifyStage(options ExecuteOptions, stage Stage, status string) {
 	if options.OnStage != nil {
+		options.callbackMu.Lock()
+		defer options.callbackMu.Unlock()
 		options.OnStage(stage, status)
 	}
 }
 
 func notifyAction(options ExecuteOptions, stage Stage, action Action, status string) {
 	if options.OnAction != nil {
+		options.callbackMu.Lock()
+		defer options.callbackMu.Unlock()
 		options.OnAction(stage, action, status)
 	}
 }
