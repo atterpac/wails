@@ -35,6 +35,7 @@ func executeTypedPipeline(
 	step string,
 ) error {
 	target, arch := targetFromArgs(otherArgs)
+	mode := buildModeFromArgs(otherArgs)
 	targets, err := requestedTargets(buildFlags.Targets)
 	if err != nil {
 		return err
@@ -44,7 +45,7 @@ func executeTypedPipeline(
 		Targets:    targets,
 		Target:     target,
 		Arch:       arch,
-		Mode:       "production",
+		Mode:       mode,
 		Tags:       strings.Split(buildFlags.Tags, ","),
 		Obfuscated: buildFlags.Obfuscated,
 		Goal:       goal,
@@ -125,7 +126,7 @@ func resolveTypedPipelineActions(
 				"bindings.generate",
 				"Generate frontend bindings from the application Go packages",
 				map[string]string{
-					"buildFlags": "-tags " + strings.Join(planTags(plan), ","),
+					"buildFlags": bindingBuildFlags(plan),
 					"clean":      "true",
 					"index":      "index",
 					"models":     "models",
@@ -155,10 +156,16 @@ func resolveTypedPipelineActions(
 				packageManager = configured
 			}
 			command := []string{packageManager, "run", "build"}
+			description := "Build the production frontend distribution"
+			environment := map[string]string{"PRODUCTION": "true"}
+			if plan.Mode == "development" {
+				command = []string{packageManager, "run", "build:dev"}
+				description = "Build the development frontend distribution"
+				environment["PRODUCTION"] = "false"
+			}
 			if configured, ok := stageSettingCommand(*stage, "build"); ok {
 				command = configured
 			}
-			environment := map[string]string{"PRODUCTION": "true"}
 			if configured, ok := stageSettingMap(*stage, "environment"); ok {
 				for name, value := range configured {
 					environment[name] = fmt.Sprint(value)
@@ -173,7 +180,7 @@ func resolveTypedPipelineActions(
 			}
 			stage.Actions = append(actions, buildsystem.Action{
 				Kind:             buildsystem.ActionCommand,
-				Description:      "Build the production frontend distribution",
+				Description:      description,
 				Status:           "planned",
 				Command:          command,
 				WorkingDirectory: directory,
@@ -243,6 +250,14 @@ func resolveTypedPipelineActions(
 	buildsystem.ResolveExpressions(plan)
 	addActionContextEnvironment(plan)
 	return nil
+}
+
+func bindingBuildFlags(plan *buildsystem.Plan) string {
+	tags := planTags(plan)
+	if len(tags) == 0 {
+		return ""
+	}
+	return "-tags " + strings.Join(tags, ",")
 }
 
 func toolchainActions(plan *buildsystem.Plan, stage buildsystem.Stage) []buildsystem.Action {
@@ -509,7 +524,11 @@ func platformActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]buildsy
 		if err != nil {
 			return nil, err
 		}
-		plist := filepath.Join(plan.Project.Root, "build", "darwin", "Info.plist")
+		plistName := "Info.plist"
+		if plan.Mode == "development" {
+			plistName = "Info.dev.plist"
+		}
+		plist := filepath.Join(plan.Project.Root, "build", "darwin", plistName)
 		if configured, ok := stageOverlay(stage, "darwin", "plist"); ok {
 			plist = resolveProjectPath(plan, configured)
 		}
@@ -750,12 +769,18 @@ func nativeCompileActions(
 	if len(tags) > 0 {
 		command = append(command, "-tags", strings.Join(tags, ","))
 	}
-	trimPath := stageSettingBoolDefault(stage, "trimPath", true)
+	trimPath := stageSettingBoolDefault(stage, "trimPath", plan.Mode != "development")
 	vcsInfo := stageSettingBoolDefault(stage, "vcsInfo", false)
 	if trimPath {
 		command = append(command, "-trimpath")
 	}
-	command = append(command, "-buildvcs="+strconv.FormatBool(vcsInfo), "-ldflags=-w -s", "-o", output)
+	command = append(command, "-buildvcs="+strconv.FormatBool(vcsInfo))
+	if plan.Mode == "development" {
+		command = append(command, "-gcflags=all=-l")
+	} else {
+		command = append(command, "-ldflags=-w -s")
+	}
+	command = append(command, "-o", output)
 	environment := map[string]string{
 		"GOOS":   stage.Target.Platform,
 		"GOARCH": stage.Target.Arch,
@@ -958,7 +983,7 @@ func bundleAssembleActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]b
 	}
 	macOS := filepath.Join(bundle, "Contents", "MacOS")
 	resources := filepath.Join(bundle, "Contents", "Resources")
-	return []buildsystem.Action{
+	actions := []buildsystem.Action{
 		{
 			Kind:        buildsystem.ActionRemove,
 			Description: "Remove the previous macOS application bundle",
@@ -1007,7 +1032,14 @@ func bundleAssembleActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]b
 			Source:      filepath.Join(plan.Project.Root, "build", "darwin", "Assets.car"),
 			Destination: filepath.Join(resources, "Assets.car"),
 		},
-	}, nil
+	}
+	if plan.Mode == "development" {
+		actions = append(actions, buildsystem.Action{
+			Kind: buildsystem.ActionCommand, Description: "Ad-hoc sign the development application bundle", Status: "planned",
+			Command: []string{"codesign", "--force", "--deep", "--sign", "-", bundle}, WorkingDirectory: plan.Project.Root,
+		})
+	}
+	return actions, nil
 }
 
 func packageCreateActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]buildsystem.Action, error) {
@@ -1639,7 +1671,7 @@ func generateBindingsAction(
 		Clean:            clean,
 		Silent:           true,
 	}
-	return GenerateBindings(options, []string{"."})
+	return GenerateBindings(options, []string{stage.Plan.Project.Root})
 }
 
 func generateIconsAction(

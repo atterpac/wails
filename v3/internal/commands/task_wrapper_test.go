@@ -582,3 +582,10 @@ func TestRequestedTargets(t *testing.T) {
 	_, err = requestedTargets([]string{"windows"})
 	require.EqualError(t, err, `invalid build target "windows"; expected platform/architecture`)
 }
+
+func TestBuildModeFromArgs(t *testing.T) {
+	assert.Equal(t, "production", buildModeFromArgs(nil))
+	assert.Equal(t, "development", buildModeFromArgs([]string{"DEV=true"}))
+	assert.Equal(t, "development", buildModeFromArgs([]string{"DEV=1"}))
+	assert.Equal(t, "production", buildModeFromArgs([]string{"DEV=false"}))
+}

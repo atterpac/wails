@@ -121,6 +121,7 @@ func printTypedPipelinePlan(
 	step string,
 ) error {
 	target, arch := targetFromArgs(otherArgs)
+	mode := buildModeFromArgs(otherArgs)
 	targets, err := requestedTargets(buildFlags.Targets)
 	if err != nil {
 		return err
@@ -130,7 +131,7 @@ func printTypedPipelinePlan(
 		Targets:    targets,
 		Target:     target,
 		Arch:       arch,
-		Mode:       "production",
+		Mode:       mode,
 		Tags:       strings.Split(buildFlags.Tags, ","),
 		Obfuscated: buildFlags.Obfuscated,
 		Goal:       goal,
@@ -157,6 +158,15 @@ func printTypedPipelinePlan(
 		return buildsystem.WriteJSON(os.Stdout, plan)
 	}
 	return buildsystem.WriteText(os.Stdout, plan)
+}
+
+func buildModeFromArgs(args []string) string {
+	for _, arg := range args {
+		if strings.EqualFold(arg, "DEV=true") || strings.EqualFold(arg, "DEV=1") {
+			return "development"
+		}
+	}
+	return "production"
 }
 
 func requestedTargets(values []string) ([]buildsystem.Target, error) {
