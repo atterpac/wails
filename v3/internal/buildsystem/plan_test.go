@@ -75,8 +75,8 @@ build:
 	assert.Equal(t, "${project.root}", native.After[0].WorkingDirectory)
 
 	bundle := findStage(t, plan, "bundle.assemble")
-	assert.Equal(t, "skipped", bundle.Status)
-	assert.Equal(t, "target uses the native binary as its runnable artifact", bundle.Reason)
+	assert.Equal(t, "planned", bundle.Status)
+	assert.Equal(t, "dist/plan-test.windows", bundle.Outputs[0].Path)
 
 	collect := findStage(t, plan, "artifacts.collect")
 	assert.Equal(t, "command", collect.Implementation)
@@ -124,12 +124,12 @@ func TestResolveExpandsTargetMatrix(t *testing.T) {
 
 	collect := findStage(t, plan, "artifacts.collect")
 	assert.Equal(t, []string{
-		"native.compile[windows/amd64]",
-		"native.compile[linux/arm64]",
+		"bundle.assemble[windows/amd64]",
+		"bundle.assemble[linux/arm64]",
 	}, collect.Needs)
 	require.Len(t, collect.Inputs, 2)
-	assert.Equal(t, "binary[windows/amd64]", collect.Inputs[0].Reference())
-	assert.Equal(t, "binary[linux/arm64]", collect.Inputs[1].Reference())
+	assert.Equal(t, "bundle[windows/amd64]", collect.Inputs[0].Reference())
+	assert.Equal(t, "bundle[linux/arm64]", collect.Inputs[1].Reference())
 
 	_, err = InspectStage(plan, "native.compile")
 	require.EqualError(
@@ -244,7 +244,7 @@ func TestResolveSignGoalActivatesWindowsSigning(t *testing.T) {
 
 	bundleSign := findStage(t, plan, "bundle.sign")
 	assert.Equal(t, "planned", bundleSign.Status)
-	assert.Equal(t, "binary[windows/amd64]", bundleSign.Inputs[0].Reference())
+	assert.Equal(t, "bundle[windows/amd64]", bundleSign.Inputs[0].Reference())
 	packageSign := findStage(t, plan, "package.sign")
 	assert.Equal(t, "planned", packageSign.Status)
 	assert.Equal(t, "package.sign[windows/amd64/nsis]", packageSign.Reference())
@@ -486,6 +486,94 @@ build:
 	require.Len(t, native[1].Before, 1)
 	assert.Equal(t, "skipped", native[1].Before[0].Status)
 	assert.Contains(t, native[1].Before[0].Reason, "platform")
+}
+
+func TestResolveExplicitUserOwnedPipeline(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "build"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "build", "config.yml"), []byte(`
+build:
+  targets:
+    - {platform: linux, arch: amd64}
+    - {platform: windows, arch: arm64}
+  pipeline:
+    generate:
+      run: [go, generate, ./...]
+      sources: ["**/*.go"]
+      produces:
+        generated: .wails/generated
+    assets:
+      uses: wails/assets.generate
+    platform:
+      uses: wails/platform.generate
+      needs: [assets]
+    compile:
+      uses: wails/native.compile
+      needs: [generate, platform]
+      with:
+        tags: [enterprise]
+      produces:
+        binary: bin/${target.platform}/${target.arch}/application
+`), 0o644))
+
+	plan, err := Resolve(Request{ProjectRoot: root})
+	require.NoError(t, err)
+	assert.Len(t, plan.Stages, 7)
+	assert.Equal(t, "generate", plan.Stages[0].Reference())
+	assert.Equal(t, ActionCommand, plan.Stages[0].Actions[0].Kind)
+	assert.Equal(t, []string{"go", "generate", "./..."}, plan.Stages[0].Actions[0].Command)
+	assert.Equal(t, []string{"**/*.go"}, plan.Stages[0].Cache.Sources)
+
+	linuxCompile := explicitStage(t, plan, "compile[linux/amd64]")
+	assert.Equal(t, "wails/native.compile", linuxCompile.Uses)
+	assert.Equal(t, "native.compile", linuxCompile.Operation())
+	assert.ElementsMatch(t, []string{"generate", "platform[linux/amd64]"}, linuxCompile.Needs)
+	assert.Equal(t, "bin/linux/amd64/application", linuxCompile.Outputs[0].Path)
+	assert.Contains(t, linuxCompile.Inputs, plan.Stages[0].Outputs[0])
+
+	windowsCompile := explicitStage(t, plan, "compile[windows/arm64]")
+	assert.ElementsMatch(t, []string{"generate", "platform[windows/arm64]"}, windowsCompile.Needs)
+	assert.Equal(t, "bin/windows/arm64/application", windowsCompile.Outputs[0].Path)
+}
+
+func TestResolveExplicitPipelineRejectsUnknownDependency(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "build"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "build", "config.yml"), []byte(`
+build:
+  pipeline:
+    compile:
+      run: [go, build]
+      needs: [missing]
+      produces: {binary: bin/app}
+`), 0o644))
+	_, err := Resolve(Request{ProjectRoot: root, Target: "linux", Arch: "amd64"})
+	require.EqualError(t, err, `pipeline stage "compile" requires unknown stage "missing"`)
+}
+
+func TestUsesExplicitPipeline(t *testing.T) {
+	root := t.TempDir()
+	config := filepath.Join(root, "config.yml")
+	require.NoError(t, os.WriteFile(config, []byte(`
+build:
+  pipeline:
+    compile:
+      run: [go, build]
+`), 0o644))
+	explicit, err := UsesExplicitPipeline(config)
+	require.NoError(t, err)
+	assert.True(t, explicit)
+}
+
+func explicitStage(t *testing.T, plan *Plan, reference string) Stage {
+	t.Helper()
+	for _, stage := range plan.Stages {
+		if stage.Reference() == reference {
+			return stage
+		}
+	}
+	t.Fatalf("stage %q not found", reference)
+	return Stage{}
 }
 
 func TestResolveRejectsReplacementWithoutArtifacts(t *testing.T) {

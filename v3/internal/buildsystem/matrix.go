@@ -221,15 +221,18 @@ func defaultStages(plan *Plan, frontendOutput string, packageFormats []string) [
 				[]string{native.Reference()},
 				"target does not require architecture combination",
 			)
-			bundle := skipped(
-				"bundle.assemble",
-				&target,
-				[]string{native.Reference(), combine.Reference()},
-				"target uses the native binary as its runnable artifact",
+			bundle := applicationBundleStage(
+				plan,
+				target,
+				native.Outputs[0],
+				platforms[key].Outputs[0],
+				assets[key].Outputs[0],
+				[]string{native.Reference(), combine.Reference(), platforms[key].Reference(), assets[key].Reference()},
+				planned,
 			)
 			stages = append(stages, combine, bundle)
 			distribution, artifacts, needs := distributionStages(
-				plan, target, native.Outputs[0], native.Reference(), packageFormats, planned, skipped,
+				plan, target, bundle.Outputs[0], bundle.Reference(), packageFormats, planned, skipped,
 			)
 			stages = append(stages, distribution...)
 			finalArtifacts = append(finalArtifacts, artifacts...)
@@ -336,6 +339,24 @@ func darwinBundleStage(
 	return planned("bundle.assemble", &target, needs, []Artifact{binary, platform}, []Artifact{bundle})
 }
 
+func applicationBundleStage(
+	plan *Plan,
+	target Target,
+	binary Artifact,
+	platform Artifact,
+	assets Artifact,
+	needs []string,
+	planned func(string, *Target, []string, []Artifact, []Artifact) Stage,
+) Stage {
+	producer := stageInstance("bundle.assemble", &target)
+	bundle := Artifact{
+		Name: "bundle", Type: "application-bundle", Path: filepath.ToSlash(bundlePath(plan, target)),
+		Producer: producer, Target: artifactTarget(&target),
+	}
+	bundle.ID = artifactIdentity(bundle)
+	return planned("bundle.assemble", &target, needs, []Artifact{binary, platform, assets}, []Artifact{bundle})
+}
+
 func distributionStages(
 	plan *Plan,
 	target Target,
@@ -347,7 +368,7 @@ func distributionStages(
 ) ([]Stage, []Artifact, []string) {
 	signing := plan.Goal == "sign" || plan.Goal == "notarize"
 	bundleSign := skipped("bundle.sign", &target, []string{runnableProducer}, "signing was not requested")
-	if signing && (target.Platform == "darwin" || target.Platform == "windows") {
+	if signing && (target.Platform == "darwin" || target.Platform == "ios" || target.Platform == "windows") {
 		bundleSign = planned("bundle.sign", &target, []string{runnableProducer}, []Artifact{runnable}, nil)
 	} else if signing {
 		bundleSign.Reason = "target does not sign its runnable artifact before packaging"
@@ -431,6 +452,10 @@ func packageFormats(platform string, requested []string) []string {
 		return []string{"zip"}
 	case "linux":
 		return []string{"deb", "rpm", "archlinux"}
+	case "android":
+		return []string{"apk"}
+	case "ios":
+		return []string{"ipa"}
 	default:
 		return nil
 	}
@@ -467,18 +492,30 @@ func packagePath(plan *Plan, target Target, format string) string {
 		return filepath.Join(directory, name+"-"+strings.ToUpper(target.Arch)+"-installer.exe")
 	case "archlinux":
 		return filepath.Join(directory, name+".pkg.tar.zst")
+	case "appimage":
+		return filepath.Join(directory, name+"-"+target.Arch+".AppImage")
+	case "msix":
+		return filepath.Join(directory, name+"-"+target.Arch+".msix")
 	default:
 		return filepath.Join(directory, name+"."+format)
 	}
 }
 
 func signablePackageFormat(platform, format string) bool {
-	return (platform == "windows" && format == "nsis") ||
+	return (platform == "windows" && (format == "nsis" || format == "msix")) ||
 		(platform == "linux" && (format == "deb" || format == "rpm"))
 }
 
 func bundlePath(plan *Plan, target Target) string {
 	name := plan.Project.BinaryName + ".app"
+	switch target.Platform {
+	case "windows":
+		name = plan.Project.BinaryName + ".windows"
+	case "linux":
+		name = plan.Project.BinaryName + ".AppDir"
+	case "android":
+		name = plan.Project.BinaryName + ".android"
+	}
 	if len(plan.Targets) == 1 {
 		return filepath.Join(plan.Project.Output, name)
 	}
@@ -489,6 +526,12 @@ func binaryPath(plan *Plan, target Target) string {
 	filename := plan.Project.BinaryName
 	if target.Platform == "windows" && !strings.EqualFold(filepath.Ext(filename), ".exe") {
 		filename += ".exe"
+	}
+	if target.Platform == "android" {
+		filename = "libwails.so"
+	}
+	if target.Platform == "ios" {
+		filename += ".a"
 	}
 	if len(plan.Targets) == 1 {
 		return filepath.Join(plan.Project.Output, filename)

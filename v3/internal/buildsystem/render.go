@@ -225,6 +225,11 @@ func writeActions(writer io.Writer, actions []Action) error {
 			if _, err := fmt.Fprintf(writer, "     command: %s\n", formatCommand(action.Command)); err != nil {
 				return err
 			}
+			if action.Shell {
+				if _, err := fmt.Fprintf(writer, "     shell execution: %s\n", formatCommand(action.ResolvedCommand)); err != nil {
+					return err
+				}
+			}
 		case ActionCheckTool:
 			if _, err := fmt.Fprintf(writer, "     tool: %s\n", action.Tool); err != nil {
 				return err

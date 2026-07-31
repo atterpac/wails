@@ -143,6 +143,73 @@ build:
 	assert.Contains(t, compile, "-buildvcs=true")
 }
 
+func TestResolveActionsForExplicitUserOwnedPipeline(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "build"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "build", "config.yml"), []byte(`
+build:
+  pipeline:
+    generate:
+      run: [go, generate, ./...]
+      produces: {generated: .wails/generated}
+    assets:
+      uses: wails/assets.generate
+    platform:
+      uses: wails/platform.generate
+      needs: [assets]
+    compile:
+      uses: wails/native.compile
+      needs: [generate, platform]
+      produces: {binary: bin/custom.exe}
+`), 0o644))
+	plan, err := buildsystem.Resolve(buildsystem.Request{ProjectRoot: root, Target: "windows", Arch: "amd64"})
+	require.NoError(t, err)
+	require.NoError(t, resolveBuildActions(plan, &flags.Build{}))
+
+	generate := commandStage(t, plan, "generate")
+	require.Len(t, generate.Actions, 1)
+	assert.Equal(t, []string{"go", "generate", "./..."}, generate.Actions[0].Command)
+
+	compile := commandStage(t, plan, "compile")
+	assert.Equal(t, "native.compile", compile.Operation())
+	require.Len(t, compile.Actions, 4)
+	assert.Contains(t, compile.Actions[2].Command, filepath.Join(root, "bin", "custom.exe"))
+}
+
+func TestResolveMinimalExplicitPipelineWithCustomPackager(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "build"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "build", "config.yml"), []byte(`
+build:
+  pipeline:
+    generate:
+      run: [go, generate, ./...]
+      produces: {generated: .wails/generated}
+    compile:
+      uses: wails/native.compile
+      needs: [generate]
+      produces: {binary: bin/application}
+    bundle:
+      uses: wails/bundle.assemble
+      needs: [compile]
+      produces: {bundle: bin/Application.AppDir}
+    package:
+      run: [./scripts/package, "${artifacts.bundle.bundle}", bin/application.custom]
+      needs: [bundle]
+      produces: {package: bin/application.custom}
+`), 0o644))
+	plan, err := buildsystem.Resolve(buildsystem.Request{ProjectRoot: root, Target: "linux", Arch: "amd64"})
+	require.NoError(t, err)
+	require.NoError(t, resolveBuildActions(plan, &flags.Build{}))
+
+	compile := commandStage(t, plan, "compile")
+	assert.Equal(t, "native.compile", compile.Operation())
+	bundle := commandStage(t, plan, "bundle")
+	assert.Equal(t, "bundle.assemble", bundle.Operation())
+	packaging := commandStage(t, plan, "package")
+	assert.Equal(t, filepath.Join(root, "bin", "Application.AppDir"), packaging.Actions[0].Command[1])
+}
+
 func commandStage(t *testing.T, plan *buildsystem.Plan, id string) buildsystem.Stage {
 	t.Helper()
 	for _, stage := range plan.Stages {
@@ -214,8 +281,8 @@ func TestResolveBuildActionsExpandsEveryMatrixTarget(t *testing.T) {
 	var inputs []collectionInput
 	require.NoError(t, json.Unmarshal([]byte(collect.Actions[0].Parameters["artifacts"]), &inputs))
 	require.Len(t, inputs, 2)
-	assert.Equal(t, "binary[windows/amd64]", inputs[0].ID)
-	assert.Equal(t, "binary[linux/arm64]", inputs[1].ID)
+	assert.Equal(t, "bundle[windows/amd64]", inputs[0].ID)
+	assert.Equal(t, "bundle[linux/arm64]", inputs[1].ID)
 }
 
 func TestResolveBuildActionsExpandsUniversalDarwinStages(t *testing.T) {
@@ -289,6 +356,111 @@ func TestDarwinBundleActionsAssembleRunnableLayout(t *testing.T) {
 	assert.NotZero(t, info.Mode().Perm()&0o111)
 	assert.FileExists(t, filepath.Join(bundlePath, "Contents", "Info.plist"))
 	assert.FileExists(t, filepath.Join(bundlePath, "Contents", "Resources", "icons.icns"))
+}
+
+func TestWindowsAndLinuxBundleActionsAssembleRunnableLayouts(t *testing.T) {
+	for _, target := range []buildsystem.Target{{Platform: "windows", Arch: "amd64"}, {Platform: "linux", Arch: "arm64"}} {
+		t.Run(target.Platform, func(t *testing.T) {
+			root := t.TempDir()
+			plan, err := buildsystem.Resolve(buildsystem.Request{ProjectRoot: root, Target: target.Platform, Arch: target.Arch})
+			require.NoError(t, err)
+			require.NoError(t, resolveBuildActions(plan, &flags.Build{}))
+			bundle := commandStage(t, plan, "bundle.assemble")
+			assert.Equal(t, "planned", bundle.Status)
+			require.NotEmpty(t, bundle.Actions)
+			assert.Equal(t, buildsystem.ActionRemove, bundle.Actions[0].Kind)
+			assert.True(t, bundle.Actions[0].Recursive)
+			if target.Platform == "windows" {
+				assert.Equal(t, filepath.Join(root, "bin", filepath.Base(root)+".windows"), bundle.Actions[0].Path)
+				assert.Equal(t, buildsystem.ActionCopy, bundle.Actions[2].Kind)
+			} else {
+				assert.Equal(t, filepath.Join(root, "bin", filepath.Base(root)+".AppDir"), bundle.Actions[0].Path)
+				assert.Contains(t, bundle.Actions[4].Destination, filepath.Join("usr", "bin"))
+			}
+		})
+	}
+}
+
+func TestResolveAdditionalDesktopPackageFormats(t *testing.T) {
+	tests := []struct {
+		platform string
+		format   string
+		tool     string
+	}{
+		{"windows", "msix", "makeappx.exe"},
+		{"linux", "appimage", "appimagetool"},
+		{"darwin", "dmg", "hdiutil"},
+		{"darwin", "pkg", "productbuild"},
+	}
+	for _, test := range tests {
+		t.Run(test.platform+"-"+test.format, func(t *testing.T) {
+			plan, err := buildsystem.Resolve(buildsystem.Request{
+				ProjectRoot: t.TempDir(), Target: test.platform, Arch: "arm64", Goal: "package", Packages: []string{test.format},
+			})
+			require.NoError(t, err)
+			require.NoError(t, resolveBuildActions(plan, &flags.Build{}))
+			stage := commandStage(t, plan, "package.create")
+			require.GreaterOrEqual(t, len(stage.Actions), 2)
+			last := stage.Actions[len(stage.Actions)-1]
+			assert.Equal(t, buildsystem.ActionCommand, last.Kind)
+			assert.Equal(t, test.tool, last.Command[0])
+		})
+	}
+}
+
+func TestResolveAndroidProductionPipeline(t *testing.T) {
+	root := t.TempDir()
+	plan, err := buildsystem.Resolve(buildsystem.Request{
+		ProjectRoot: root, Target: "android", Arch: "arm64", Goal: "package", Packages: []string{"apk", "aab"},
+	})
+	require.NoError(t, err)
+	require.NoError(t, resolveBuildActions(plan, &flags.Build{}))
+
+	platform := commandStage(t, plan, "platform.generate")
+	assert.Equal(t, "platform.generate-android", platform.Actions[1].Internal)
+	native := commandStage(t, plan, "native.compile")
+	assert.Equal(t, "libwails.so", filepath.Base(native.Outputs[0].Path))
+	assert.Equal(t, []string{"/bin/sh", "-c"}, native.Actions[1].Command[:2])
+	assert.Contains(t, native.Actions[1].Command[2], "ANDROID_NDK_HOME")
+	bundle := commandStage(t, plan, "bundle.assemble")
+	assert.True(t, bundle.Actions[1].Recursive)
+	assert.Contains(t, bundle.Actions[3].Destination, filepath.Join("jniLibs", "arm64-v8a", "libwails.so"))
+
+	packages := stagesByOperation(plan, "package.create")
+	require.Len(t, packages, 2)
+	assert.Contains(t, packages[0].Actions[1].Command[2], "assembleRelease")
+	assert.Contains(t, packages[1].Actions[1].Command[2], "bundleRelease")
+}
+
+func TestResolveIOSProductionPipeline(t *testing.T) {
+	root := t.TempDir()
+	plan, err := buildsystem.Resolve(buildsystem.Request{ProjectRoot: root, Target: "ios", Arch: "arm64", Goal: "package", Packages: []string{"ipa"}})
+	require.NoError(t, err)
+	require.NoError(t, resolveBuildActions(plan, &flags.Build{}))
+
+	platform := commandStage(t, plan, "platform.generate")
+	require.Len(t, platform.Actions, 3)
+	assert.Equal(t, "platform.generate-ios-overlay", platform.Actions[1].Internal)
+	assert.Equal(t, "platform.generate-ios-xcode", platform.Actions[2].Internal)
+	native := commandStage(t, plan, "native.compile")
+	assert.Equal(t, ".a", filepath.Ext(native.Outputs[0].Path))
+	assert.Contains(t, native.Actions[1].Command[2], "xcrun --sdk iphoneos")
+	bundle := commandStage(t, plan, "bundle.assemble")
+	assert.Equal(t, "xcrun", bundle.Actions[2].Command[0])
+	assert.Equal(t, "actool", bundle.Actions[4].Command[1])
+	packaging := commandStage(t, plan, "package.create")
+	assert.True(t, packaging.Actions[3].Recursive)
+	assert.Equal(t, "package.zip", packaging.Actions[4].Internal)
+}
+
+func stagesByOperation(plan *buildsystem.Plan, operation string) []buildsystem.Stage {
+	var result []buildsystem.Stage
+	for _, stage := range plan.Stages {
+		if stage.Operation() == operation && stage.Status == "planned" {
+			result = append(result, stage)
+		}
+	}
+	return result
 }
 
 func TestCollectArtifactsWritesFilesAndBundles(t *testing.T) {
@@ -440,6 +612,21 @@ func TestResolvePipelineSigningOptionsUsesProjectConfiguration(t *testing.T) {
 	assert.Equal(t, "project-notary", resolved.KeychainProfile)
 	assert.True(t, resolved.HardenedRuntime)
 	assert.False(t, resolved.Notarize)
+}
+
+func TestResolvePipelineSigningOptionsUsesEnvironmentProvider(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("RELEASE_IDENTITY", "Environment Identity")
+	t.Setenv("RELEASE_CERTIFICATE", "certificates/release.pfx")
+	t.Setenv("RELEASE_KEYCHAIN_PROFILE", "environment-notary")
+	plan := &buildsystem.Plan{Project: buildsystem.Project{Root: root}}
+	plan.Signing.Credentials.Provider = "environment"
+	plan.Signing.Credentials.Prefix = "RELEASE_"
+
+	resolved := resolvePipelineSigningOptions(plan, nil)
+	assert.Equal(t, "Environment Identity", resolved.Identity)
+	assert.Equal(t, filepath.Join(root, "certificates", "release.pfx"), resolved.Certificate)
+	assert.Equal(t, "environment-notary", resolved.KeychainProfile)
 }
 
 func TestCreateZipArtifactIsDeterministic(t *testing.T) {

@@ -309,10 +309,17 @@ func executeAction(
 ) error {
 	switch action.Kind {
 	case ActionCommand:
+		command := action.Command
+		if action.Shell {
+			command = action.ResolvedCommand
+			if len(command) == 0 {
+				command = shellCommand(action.Command)
+			}
+		}
 		return executeCommand(
 			ctx,
 			stageContext,
-			action.Command,
+			command,
 			action.WorkingDirectory,
 			action.Environment,
 			action.Timeout,
@@ -329,7 +336,14 @@ func executeAction(
 				return nil
 			}
 		}
-		return copyFile(source, expand(action.Destination, stageContext))
+		destination := expand(action.Destination, stageContext)
+		if action.Recursive {
+			if err := os.RemoveAll(destination); err != nil {
+				return err
+			}
+			return copyPath(source, destination)
+		}
+		return copyFile(source, destination)
 	case ActionInternal:
 		implementation := internalActions[action.Internal]
 		if implementation == nil {

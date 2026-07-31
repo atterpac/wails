@@ -65,6 +65,7 @@ type Stage struct {
 	Instance       string         `json:"instance"`
 	Target         *Target        `json:"target,omitempty"`
 	Implementation string         `json:"implementation"`
+	Uses           string         `json:"uses,omitempty"`
 	Needs          []string       `json:"needs,omitempty"`
 	Status         string         `json:"status"`
 	Reason         string         `json:"reason,omitempty"`
@@ -78,10 +79,19 @@ type Stage struct {
 	Cache          CachePolicy    `json:"cache"`
 }
 
+func (stage Stage) Operation() string {
+	if stage.Uses != "" {
+		return strings.TrimPrefix(stage.Uses, "wails/")
+	}
+	return stage.ID
+}
+
 type CachePolicy struct {
-	Enabled    bool     `json:"enabled"`
-	Sources    []string `json:"sources,omitempty"`
-	Exclusions []string `json:"exclusions,omitempty"`
+	Enabled     bool              `json:"enabled"`
+	Sources     []string          `json:"sources,omitempty"`
+	Exclusions  []string          `json:"exclusions,omitempty"`
+	Environment []string          `json:"environment,omitempty"`
+	Values      map[string]string `json:"values,omitempty"`
 }
 
 type Artifact struct {
@@ -125,6 +135,8 @@ type Action struct {
 	Optional         bool              `json:"optional,omitempty"`
 	Recursive        bool              `json:"recursive,omitempty"`
 	Command          []string          `json:"command,omitempty"`
+	Shell            bool              `json:"shell,omitempty"`
+	ResolvedCommand  []string          `json:"resolvedCommand,omitempty"`
 	WorkingDirectory string            `json:"workingDirectory,omitempty"`
 	Environment      map[string]string `json:"environment,omitempty"`
 	Timeout          string            `json:"timeout,omitempty"`
@@ -217,6 +229,10 @@ type PackageConfig struct {
 }
 
 type SigningConfig struct {
+	Credentials struct {
+		Provider string `yaml:"provider" json:"provider,omitempty"`
+		Prefix   string `yaml:"prefix" json:"prefix,omitempty"`
+	} `yaml:"credentials" json:"credentials,omitempty"`
 	Darwin struct {
 		Identity        string `yaml:"identity" json:"identity,omitempty"`
 		Entitlements    string `yaml:"entitlements" json:"entitlements,omitempty"`
@@ -249,7 +265,8 @@ type projectConfig struct {
 			PackageManager string `yaml:"packageManager"`
 			Output         string `yaml:"output"`
 		} `yaml:"frontend"`
-		Stages map[string]stageConfig `yaml:"stages"`
+		Stages   map[string]stageConfig `yaml:"stages"`
+		Pipeline ExplicitPipeline       `yaml:"pipeline"`
 	} `yaml:"build"`
 }
 
@@ -363,9 +380,28 @@ func Resolve(request Request) (*Plan, error) {
 		Goal:    goal,
 		Signing: cfg.Build.Signing,
 	}
-	plan.Stages = defaultStages(plan, frontendOutput, packages)
+	if provider := plan.Signing.Credentials.Provider; provider != "" && provider != "environment" && provider != "keychain" {
+		return nil, fmt.Errorf("unsupported signing credential provider %q", provider)
+	}
+	if len(cfg.Build.Pipeline) > 0 {
+		if len(cfg.Build.Stages) > 0 {
+			return nil, fmt.Errorf("build.stages cannot be combined with build.pipeline")
+		}
+		plan.Stages, err = resolveExplicitPipeline(plan, cfg.Build.Pipeline, frontendOutput, packages)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		plan.Stages = defaultStages(plan, frontendOutput, packages)
+	}
 	normaliseCachePolicies(plan)
-	if err := applyStageConfig(plan, cfg.Build.Stages); err != nil {
+	if len(cfg.Build.Pipeline) > 0 {
+		applyExplicitCacheSources(plan.Stages, cfg.Build.Pipeline)
+	}
+	if len(cfg.Build.Pipeline) == 0 {
+		err = applyStageConfig(plan, cfg.Build.Stages)
+	}
+	if err != nil {
 		return nil, err
 	}
 	normaliseArtifacts(plan)
@@ -389,6 +425,11 @@ func normaliseCachePolicies(plan *Plan) {
 			Sources:    []string{"${project.root}"},
 			Exclusions: []string{".git", ".wails", ".beads", "node_modules", plan.Project.Output},
 		}
+		if stage.Operation() == "package.create" && stage.Target != nil && stage.Target.Platform == "android" {
+			stage.Cache.Environment = []string{
+				"ANDROID_KEYSTORE_FILE", "ANDROID_KEYSTORE_PASSWORD", "ANDROID_KEY_ALIAS", "ANDROID_KEY_PASSWORD",
+			}
+		}
 	}
 }
 
@@ -396,7 +437,7 @@ func cacheableStage(stage Stage) bool {
 	if len(stage.Outputs) == 0 {
 		return false
 	}
-	switch stage.ID {
+	switch stage.Operation() {
 	case "bundle.sign", "package.sign", "package.notarize":
 		return false
 	default:
@@ -586,7 +627,7 @@ func validateStageSettings(stageID string, settings map[string]any) error {
 	}
 	allowed := map[string]map[string]string{
 		"dependencies.prepare": {"goModules": "string", "frontend": "string"},
-		"frontend.build":       {"directory": "string", "install": "command", "build": "command", "output": "string", "environment": "map"},
+		"frontend.build":       {"directory": "string", "packageManager": "string", "install": "command", "build": "command", "output": "string", "environment": "map"},
 		"platform.generate":    {"overlays": "map"},
 		"native.compile":       {"tags": "strings", "trimPath": "bool", "vcsInfo": "bool"},
 	}[stageID]
@@ -739,6 +780,17 @@ func loadConfig(path string) (projectConfig, bool, error) {
 		return cfg, false, fmt.Errorf("parse build configuration %s: %w", path, err)
 	}
 	return cfg, true, nil
+}
+
+func UsesExplicitPipeline(path string) (bool, error) {
+	if path == "" {
+		path = filepath.Join("build", "config.yml")
+	}
+	config, found, err := loadConfig(path)
+	if err != nil || !found {
+		return false, err
+	}
+	return len(config.Build.Pipeline) > 0, nil
 }
 
 func detectPackageManager(frontendDir string) string {

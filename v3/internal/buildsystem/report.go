@@ -32,17 +32,24 @@ type ExecutionReport struct {
 }
 
 type StageExecutionReport struct {
-	ID          string                  `json:"id"`
-	Instance    string                  `json:"instance"`
-	Status      string                  `json:"status"`
-	Fingerprint string                  `json:"fingerprint,omitempty"`
-	Cache       string                  `json:"cache"`
-	StartedAt   *time.Time              `json:"startedAt,omitempty"`
-	FinishedAt  *time.Time              `json:"finishedAt,omitempty"`
-	Duration    string                  `json:"duration,omitempty"`
-	Error       string                  `json:"error,omitempty"`
-	Outputs     []Artifact              `json:"outputs,omitempty"`
-	Actions     []ActionExecutionReport `json:"actions,omitempty"`
+	ID          string                    `json:"id"`
+	Instance    string                    `json:"instance"`
+	Status      string                    `json:"status"`
+	Fingerprint string                    `json:"fingerprint,omitempty"`
+	Cache       string                    `json:"cache"`
+	StartedAt   *time.Time                `json:"startedAt,omitempty"`
+	FinishedAt  *time.Time                `json:"finishedAt,omitempty"`
+	Duration    string                    `json:"duration,omitempty"`
+	Error       string                    `json:"error,omitempty"`
+	Outputs     []ArtifactExecutionReport `json:"outputs,omitempty"`
+	Actions     []ActionExecutionReport   `json:"actions,omitempty"`
+}
+
+type ArtifactExecutionReport struct {
+	Artifact Artifact `json:"artifact"`
+	Exists   bool     `json:"exists"`
+	Size     int64    `json:"size,omitempty"`
+	SHA256   string   `json:"sha256,omitempty"`
 }
 
 type ActionExecutionReport struct {
@@ -124,7 +131,10 @@ func newExecutionRuntime(plan *Plan, options ExecuteOptions, selected map[string
 			continue
 		}
 		indexes[stage.Reference()] = len(report.Stages)
-		entry := StageExecutionReport{ID: stage.ID, Instance: stage.Reference(), Status: "pending", Cache: "disabled", Outputs: stage.Outputs}
+		entry := StageExecutionReport{ID: stage.ID, Instance: stage.Reference(), Status: "pending", Cache: "disabled"}
+		for _, output := range stage.Outputs {
+			entry.Outputs = append(entry.Outputs, ArtifactExecutionReport{Artifact: output})
+		}
 		for index, action := range stage.Actions {
 			status := "pending"
 			if action.Status == "skipped" {
@@ -180,12 +190,14 @@ func (recorder *reportRecorder) stageStarted(stage Stage, fingerprint, cacheDeci
 }
 
 func (recorder *reportRecorder) stageFinished(stage Stage, status, cacheDecision string, err error) {
+	provenance := collectOutputProvenance(recorder.report.ProjectRoot, stage.Outputs)
 	recorder.update(func(report *ExecutionReport) {
 		entry := &report.Stages[recorder.indexes[stage.Reference()]]
 		now := time.Now().UTC()
 		entry.FinishedAt = &now
 		entry.Status = status
 		entry.Cache = cacheDecision
+		entry.Outputs = provenance
 		if entry.StartedAt != nil {
 			entry.Duration = now.Sub(*entry.StartedAt).String()
 		}
@@ -193,6 +205,27 @@ func (recorder *reportRecorder) stageFinished(stage Stage, status, cacheDecision
 			entry.Error = err.Error()
 		}
 	})
+}
+
+func collectOutputProvenance(root string, artifacts []Artifact) []ArtifactExecutionReport {
+	result := make([]ArtifactExecutionReport, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		entry := ArtifactExecutionReport{Artifact: artifact}
+		if artifact.Path == "" {
+			result = append(result, entry)
+			continue
+		}
+		path := resolvePath(root, artifact.Path)
+		if _, err := os.Lstat(path); err != nil {
+			result = append(result, entry)
+			continue
+		}
+		entry.Exists = true
+		entry.SHA256, _ = hashFilesystemPath(path)
+		entry.Size, _ = filesystemSize(path)
+		result = append(result, entry)
+	}
+	return result
 }
 
 func (recorder *reportRecorder) actionStarted(stage Stage, index int) {

@@ -63,6 +63,12 @@ func registerArtifacts(registry map[string]Artifact, artifacts []Artifact) {
 			continue
 		}
 		registry[artifact.Name] = artifact
+		if artifact.Producer != "" {
+			registry[artifact.Producer+"."+artifact.Name] = artifact
+			if base, _, qualified := strings.Cut(artifact.Producer, "["); qualified {
+				registry[base+"."+artifact.Name] = artifact
+			}
+		}
 	}
 }
 

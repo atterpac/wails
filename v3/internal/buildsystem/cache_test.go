@@ -51,6 +51,10 @@ func TestExecuteStoresAndRestoresStageCache(t *testing.T) {
 	require.Len(t, report.Stages, 1)
 	assert.Equal(t, "hit", report.Stages[0].Cache)
 	assert.NotEmpty(t, report.Stages[0].Fingerprint)
+	require.Len(t, report.Stages[0].Outputs, 1)
+	assert.True(t, report.Stages[0].Outputs[0].Exists)
+	assert.Positive(t, report.Stages[0].Outputs[0].Size)
+	assert.NotEmpty(t, report.Stages[0].Outputs[0].SHA256)
 }
 
 func TestStageCacheInvalidatesWhenProjectSourcesChange(t *testing.T) {

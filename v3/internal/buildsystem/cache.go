@@ -60,6 +60,12 @@ func (store *cacheStore) fingerprint(plan *Plan, stage Stage, artifacts map[stri
 		inputs[input.Reference()] = hash
 	}
 	hookInputs := make(map[string]string)
+	for _, name := range stage.Cache.Environment {
+		hookInputs["stage/env/"+name] = os.Getenv(name)
+	}
+	for name, value := range stage.Cache.Values {
+		hookInputs["stage/value/"+name] = value
+	}
 	for _, hook := range append(append([]Hook(nil), stage.Before...), stage.After...) {
 		if hook.Status == "skipped" {
 			continue
@@ -268,6 +274,24 @@ func hashFilesystemPath(path string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func filesystemSize(path string) (int64, error) {
+	var size int64
+	err := filepath.WalkDir(path, func(current string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type().IsRegular() {
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			size += info.Size()
+		}
+		return nil
+	})
+	return size, err
 }
 
 func hashEntry(writer io.Writer, path string, entry fs.DirEntry) error {

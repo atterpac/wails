@@ -104,7 +104,7 @@ func resolveTypedPipelineActions(
 			continue
 		}
 
-		switch stage.ID {
+		switch stage.Operation() {
 		case "project.resolve":
 			stage.Actions = []buildsystem.Action{{
 				Kind:        buildsystem.ActionMkdir,
@@ -150,7 +150,11 @@ func resolveTypedPipelineActions(
 			if configured, ok := stageSettingString(*stage, "directory"); ok {
 				directory = resolveProjectPath(plan, configured)
 			}
-			command := []string{plan.Project.PackageManager, "run", "build"}
+			packageManager := plan.Project.PackageManager
+			if configured, ok := stageSettingString(*stage, "packageManager"); ok {
+				packageManager = configured
+			}
+			command := []string{packageManager, "run", "build"}
 			if configured, ok := stageSettingCommand(*stage, "build"); ok {
 				command = configured
 			}
@@ -236,6 +240,7 @@ func resolveTypedPipelineActions(
 			)}
 		}
 	}
+	buildsystem.ResolveExpressions(plan)
 	addActionContextEnvironment(plan)
 	return nil
 }
@@ -252,16 +257,33 @@ func toolchainActions(plan *buildsystem.Plan, stage buildsystem.Stage) []buildsy
 	if target.Platform == "linux" || target.Platform == "darwin" {
 		tools = append(tools, "cc")
 	}
+	if target.Platform == "android" {
+		tools = append(tools, "java")
+	}
+	if target.Platform == "ios" {
+		tools = append(tools, "xcrun")
+	}
 	for _, candidate := range plan.Stages {
 		if candidate.Status != "planned" || candidate.Target == nil ||
 			candidate.Target.Platform != target.Platform ||
 			(candidate.Target.Arch != target.Arch && candidate.Target.Arch != "universal") {
 			continue
 		}
-		switch candidate.ID {
+		switch candidate.Operation() {
 		case "package.create":
-			if len(candidate.Outputs) > 0 && candidate.Outputs[0].Target.Format == "nsis" {
-				tools = appendUnique(tools, "makensis")
+			if len(candidate.Outputs) > 0 {
+				switch candidate.Outputs[0].Target.Format {
+				case "nsis":
+					tools = appendUnique(tools, "makensis")
+				case "msix":
+					tools = appendUnique(tools, "makeappx.exe")
+				case "appimage":
+					tools = appendUnique(tools, "appimagetool")
+				case "dmg":
+					tools = appendUnique(tools, "hdiutil")
+				case "pkg":
+					tools = appendUnique(tools, "productbuild")
+				}
 			}
 		case "bundle.sign":
 			switch target.Platform {
@@ -507,6 +529,28 @@ func platformActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]buildsy
 				Destination: filepath.Join(output, "icons.icns"),
 			},
 		), nil
+	case "android":
+		return append(actions, internalBuildActionWithParameters(
+			"platform.generate-android",
+			"Generate the Android Go overlay",
+			map[string]string{
+				"config": plan.Project.Config,
+				"output": filepath.Join(output, "overlay.json"),
+			},
+		)), nil
+	case "ios":
+		return append(actions,
+			internalBuildActionWithParameters(
+				"platform.generate-ios-overlay",
+				"Generate the iOS Go overlay",
+				map[string]string{"config": plan.Project.Config, "output": filepath.Join(output, "overlay.json")},
+			),
+			internalBuildActionWithParameters(
+				"platform.generate-ios-xcode",
+				"Generate the iOS Xcode project and assets",
+				map[string]string{"config": plan.Project.Config, "output": output},
+			),
+		), nil
 	default:
 		return actions, nil
 	}
@@ -564,7 +608,7 @@ func dependencyActions(plan *buildsystem.Plan, stage buildsystem.Stage) []builds
 		frontendPolicy = configured
 	}
 	for _, candidate := range plan.Stages {
-		if candidate.ID == "frontend.build" {
+		if candidate.Operation() == "frontend.build" {
 			if _, configured := stageSettingCommand(candidate, "install"); configured {
 				frontendPolicy = "none"
 			}
@@ -579,7 +623,16 @@ func dependencyActions(plan *buildsystem.Plan, stage buildsystem.Stage) []builds
 	if _, err := os.Stat(filepath.Join(frontend, "package.json")); os.IsNotExist(err) {
 		return actions
 	}
-	name, args := frontendInstallCommand(frontend, plan.Project.PackageManager)
+	packageManager := plan.Project.PackageManager
+	for _, candidate := range plan.Stages {
+		if candidate.Operation() == "frontend.build" {
+			if configured, ok := stageSettingString(candidate, "packageManager"); ok {
+				packageManager = configured
+			}
+			break
+		}
+	}
+	name, args := frontendInstallCommand(frontend, packageManager)
 	action := buildsystem.Action{
 		Kind:             buildsystem.ActionCommand,
 		Description:      "Install frontend dependencies",
@@ -619,22 +672,74 @@ func nativeCompileActions(
 		Status:      "planned",
 		Path:        filepath.Dir(output),
 	}}
-
-	var temporaryResource string
-	if stage.Target.Platform == "windows" {
+	if stage.Target.Platform == "android" {
 		platform, err := stageInputPath(plan, stage, "platform")
 		if err != nil {
 			return nil, err
 		}
-		name := "rsrc_windows_" + stage.Target.Arch + ".syso"
-		temporaryResource = filepath.Join(plan.Project.Root, name)
-		actions = append(actions, buildsystem.Action{
-			Kind:        buildsystem.ActionCopy,
-			Description: "Install the generated Windows resource for Go compilation",
-			Status:      "planned",
-			Source:      filepath.Join(platform, name),
-			Destination: temporaryResource,
-		})
+		command := []string{"go", "build", "-buildmode=c-shared", "-overlay", filepath.Join(platform, "overlay.json")}
+		tags := appendUniqueStrings(stage.Target.Tags, "android")
+		if len(tags) > 0 {
+			command = append(command, "-tags", strings.Join(tags, ","))
+		}
+		command = append(command, "-trimpath", "-buildvcs=false", "-ldflags=-w -s", "-o", output)
+		script, err := androidCompileScript(stage.Target.Arch, command)
+		if err != nil {
+			return nil, err
+		}
+		return append(actions, buildsystem.Action{
+			Kind: buildsystem.ActionCommand, Description: "Compile the Android shared library", Status: "planned",
+			Command: []string{"/bin/sh", "-c", script}, WorkingDirectory: plan.Project.Root,
+			Environment: map[string]string{"GOOS": "android", "GOARCH": stage.Target.Arch, "CGO_ENABLED": "1"},
+		}), nil
+	}
+	if stage.Target.Platform == "ios" {
+		platform, err := stageInputPath(plan, stage, "platform")
+		if err != nil {
+			return nil, err
+		}
+		command := []string{"go", "build", "-buildmode=c-archive", "-overlay", filepath.Join(platform, "overlay.json")}
+		tags := appendUniqueStrings(stage.Target.Tags, "ios")
+		if len(tags) > 0 {
+			command = append(command, "-tags", strings.Join(tags, ","))
+		}
+		command = append(command, "-trimpath", "-buildvcs=false", "-ldflags=-w -s", "-o", output)
+		target := "arm64-apple-ios13.0"
+		sdk := "iphoneos"
+		if stage.Target.Arch == "amd64" {
+			target = "x86_64-apple-ios13.0-simulator"
+			sdk = "iphonesimulator"
+		}
+		quoted := make([]string, len(command))
+		for index, argument := range command {
+			quoted[index] = shellQuote(argument)
+		}
+		script := "set -eu\nSDK_PATH=$(xcrun --sdk " + sdk + " --show-sdk-path)\n" +
+			"export CGO_CFLAGS=\"-isysroot $SDK_PATH -target " + target + "\"\n" +
+			"export CGO_LDFLAGS=\"-isysroot $SDK_PATH -target " + target + "\"\n" +
+			"exec " + strings.Join(quoted, " ")
+		return append(actions, buildsystem.Action{
+			Kind: buildsystem.ActionCommand, Description: "Compile the iOS native archive", Status: "planned",
+			Command: []string{"/bin/sh", "-c", script}, WorkingDirectory: plan.Project.Root,
+			Environment: map[string]string{
+				"GOOS": "ios", "GOARCH": stage.Target.Arch, "CGO_ENABLED": "1",
+			},
+		}), nil
+	}
+
+	var temporaryResource string
+	if stage.Target.Platform == "windows" {
+		if platform, ok := optionalStageInputPath(plan, stage, "platform"); ok {
+			name := "rsrc_windows_" + stage.Target.Arch + ".syso"
+			temporaryResource = filepath.Join(plan.Project.Root, name)
+			actions = append(actions, buildsystem.Action{
+				Kind:        buildsystem.ActionCopy,
+				Description: "Install the generated Windows resource for Go compilation",
+				Status:      "planned",
+				Source:      filepath.Join(platform, name),
+				Destination: temporaryResource,
+			})
+		}
 	}
 
 	command := []string{"go", "build"}
@@ -685,6 +790,31 @@ func nativeCompileActions(
 	return actions, nil
 }
 
+func androidCompileScript(arch string, command []string) (string, error) {
+	triple := map[string]string{"arm64": "aarch64-linux-android", "amd64": "x86_64-linux-android", "386": "i686-linux-android"}[arch]
+	if triple == "" {
+		return "", fmt.Errorf("unsupported Android architecture %q", arch)
+	}
+	host := map[string]string{"darwin": "darwin-x86_64", "linux": "linux-x86_64"}[runtime.GOOS]
+	if host == "" {
+		return "", fmt.Errorf("Android cross-compilation is unsupported on host %q", runtime.GOOS)
+	}
+	quoted := make([]string, len(command))
+	for index, argument := range command {
+		quoted[index] = shellQuote(argument)
+	}
+	return "set -eu\n" +
+		`NDK_ROOT="${ANDROID_NDK_HOME:-}"` + "\n" +
+		`if [ -z "$NDK_ROOT" ]; then SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"; NDK_ROOT=$(find "$SDK_ROOT/ndk" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -1); fi` + "\n" +
+		`if [ -z "$NDK_ROOT" ] || [ ! -d "$NDK_ROOT" ]; then echo "Android NDK not found; set ANDROID_NDK_HOME" >&2; exit 1; fi` + "\n" +
+		"export CC=\"$NDK_ROOT/toolchains/llvm/prebuilt/" + host + "/bin/" + triple + "21-clang\"\n" +
+		"exec " + strings.Join(quoted, " "), nil
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
+}
+
 func binaryCombineActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]buildsystem.Action, error) {
 	output, err := planStageOutputPath(plan, stage, "binary")
 	if err != nil {
@@ -722,8 +852,8 @@ func binaryCombineActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]bu
 }
 
 func bundleAssembleActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]buildsystem.Action, error) {
-	if stage.Target == nil || stage.Target.Platform != "darwin" {
-		return nil, fmt.Errorf("stage %s is not a macOS bundle stage", stage.Reference())
+	if stage.Target == nil {
+		return nil, fmt.Errorf("stage %s has no target", stage.Reference())
 	}
 	bundle, err := planStageOutputPath(plan, stage, "bundle")
 	if err != nil {
@@ -733,9 +863,98 @@ func bundleAssembleActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]b
 	if err != nil {
 		return nil, err
 	}
-	platform, err := stageInputPath(plan, stage, "platform")
-	if err != nil {
-		return nil, err
+	var darwinPlatform string
+	switch stage.Target.Platform {
+	case "windows":
+		actions := []buildsystem.Action{
+			{Kind: buildsystem.ActionRemove, Description: "Remove the previous Windows application layout", Status: "planned", Recursive: true, Path: bundle},
+			{Kind: buildsystem.ActionMkdir, Description: "Create the Windows application layout", Status: "planned", Path: bundle},
+			{Kind: buildsystem.ActionCopy, Description: "Install the Windows executable", Status: "planned", Source: binary, Destination: filepath.Join(bundle, filepath.Base(binary))},
+		}
+		if assets, ok := optionalStageInputPath(plan, stage, "assets"); ok {
+			actions = append(actions, buildsystem.Action{Kind: buildsystem.ActionCopy, Description: "Install the Windows application icon", Status: "planned", Optional: true, Source: filepath.Join(assets, "icon.ico"), Destination: filepath.Join(bundle, "icon.ico")})
+		}
+		return actions, nil
+	case "linux":
+		usrBin := filepath.Join(bundle, "usr", "bin")
+		applications := filepath.Join(bundle, "usr", "share", "applications")
+		icons := filepath.Join(bundle, "usr", "share", "icons", "hicolor", "256x256", "apps")
+		actions := []buildsystem.Action{
+			{Kind: buildsystem.ActionRemove, Description: "Remove the previous Linux AppDir", Status: "planned", Recursive: true, Path: bundle},
+			{Kind: buildsystem.ActionMkdir, Description: "Create the Linux executable directory", Status: "planned", Path: usrBin},
+			{Kind: buildsystem.ActionMkdir, Description: "Create the Linux desktop entry directory", Status: "planned", Path: applications},
+			{Kind: buildsystem.ActionMkdir, Description: "Create the Linux icon directory", Status: "planned", Path: icons},
+			{Kind: buildsystem.ActionCopy, Description: "Install the Linux executable", Status: "planned", Source: binary, Destination: filepath.Join(usrBin, plan.Project.BinaryName)},
+			{Kind: buildsystem.ActionCopy, Description: "Install the AppImage launcher", Status: "planned", Source: binary, Destination: filepath.Join(bundle, "AppRun")},
+			{Kind: buildsystem.ActionCopy, Description: "Install the optional Linux desktop entry", Status: "planned", Optional: true, Source: filepath.Join(plan.Project.Root, "build", "linux", plan.Project.BinaryName+".desktop"), Destination: filepath.Join(applications, plan.Project.BinaryName+".desktop")},
+			{Kind: buildsystem.ActionCopy, Description: "Install the optional AppImage desktop entry", Status: "planned", Optional: true, Source: filepath.Join(plan.Project.Root, "build", "linux", plan.Project.BinaryName+".desktop"), Destination: filepath.Join(bundle, plan.Project.BinaryName+".desktop")},
+		}
+		if assets, ok := optionalStageInputPath(plan, stage, "assets"); ok {
+			actions = append(actions,
+				buildsystem.Action{Kind: buildsystem.ActionCopy, Description: "Install the Linux application icon", Status: "planned", Optional: true, Source: filepath.Join(assets, "appicon.png"), Destination: filepath.Join(icons, plan.Project.BinaryName+".png")},
+				buildsystem.Action{Kind: buildsystem.ActionCopy, Description: "Install the optional AppImage root icon", Status: "planned", Optional: true, Source: filepath.Join(assets, "appicon.png"), Destination: filepath.Join(bundle, plan.Project.BinaryName+".png")},
+			)
+		}
+		return actions, nil
+	case "android":
+		gradleProject := filepath.Join(plan.Project.Root, "build", "android")
+		abi := map[string]string{"arm64": "arm64-v8a", "amd64": "x86_64", "386": "x86"}[stage.Target.Arch]
+		if abi == "" {
+			return nil, fmt.Errorf("unsupported Android architecture %q", stage.Target.Arch)
+		}
+		jni := filepath.Join(bundle, "app", "src", "main", "jniLibs", abi)
+		return []buildsystem.Action{
+			{Kind: buildsystem.ActionRemove, Description: "Remove the previous Android staging project", Status: "planned", Recursive: true, Path: bundle},
+			{Kind: buildsystem.ActionCopy, Description: "Stage the Android Gradle project", Status: "planned", Recursive: true, Source: gradleProject, Destination: bundle},
+			{Kind: buildsystem.ActionMkdir, Description: "Create the Android JNI library directory", Status: "planned", Path: jni},
+			{Kind: buildsystem.ActionCopy, Description: "Install the Android shared library", Status: "planned", Source: binary, Destination: filepath.Join(jni, "libwails.so")},
+		}, nil
+	case "ios":
+		platform, err := stageInputPath(plan, stage, "platform")
+		if err != nil {
+			return nil, err
+		}
+		target := "arm64-apple-ios13.0"
+		sdk := "iphoneos"
+		if stage.Target.Arch == "amd64" {
+			target = "x86_64-apple-ios13.0-simulator"
+			sdk = "iphonesimulator"
+		}
+		mainDirectory := filepath.Join(platform, "main")
+		executable := filepath.Join(bundle, strings.ToLower(plan.Project.BinaryName))
+		return []buildsystem.Action{
+			{Kind: buildsystem.ActionRemove, Description: "Remove the previous iOS application bundle", Status: "planned", Recursive: true, Path: bundle},
+			{Kind: buildsystem.ActionMkdir, Description: "Create the iOS application bundle", Status: "planned", Path: bundle},
+			{Kind: buildsystem.ActionCommand, Description: "Link the iOS application executable", Status: "planned",
+				Command: []string{"xcrun", "-sdk", sdk, "clang", "-target", target,
+					"-framework", "Foundation", "-framework", "UIKit", "-framework", "WebKit", "-framework", "Security",
+					"-framework", "CoreFoundation", "-framework", "UniformTypeIdentifiers", "-framework", "LocalAuthentication",
+					"-framework", "UserNotifications", "-framework", "AVFoundation", "-framework", "CoreLocation",
+					"-framework", "CoreMotion", "-framework", "SystemConfiguration", "-lresolv",
+					"-o", executable, filepath.Join(mainDirectory, "main.m"), "-Wl,-force_load," + binary},
+				WorkingDirectory: plan.Project.Root,
+			},
+			{Kind: buildsystem.ActionCopy, Description: "Install the iOS application property list", Status: "planned", Source: filepath.Join(mainDirectory, "Info.plist"), Destination: filepath.Join(bundle, "Info.plist")},
+			{Kind: buildsystem.ActionCommand, Description: "Compile the iOS asset catalog", Status: "planned",
+				Command: []string{"xcrun", "actool", "--compile", bundle, "--app-icon", "AppIcon", "--platform", sdk,
+					"--minimum-deployment-target", "13.0", "--product-type", "com.apple.product-type.application",
+					"--target-device", "iphone", "--target-device", "ipad", "--output-partial-info-plist",
+					filepath.Join(bundle, "assetcatalog_generated_info.plist"), filepath.Join(mainDirectory, "Assets.xcassets")},
+				WorkingDirectory: plan.Project.Root,
+			},
+			{Kind: buildsystem.ActionCommand, Description: "Merge generated iOS asset metadata", Status: "planned",
+				Command:          []string{"/usr/libexec/PlistBuddy", "-c", "Merge " + filepath.Join(bundle, "assetcatalog_generated_info.plist"), filepath.Join(bundle, "Info.plist")},
+				WorkingDirectory: plan.Project.Root,
+			},
+		}, nil
+	case "darwin":
+		platform, ok := optionalStageInputPath(plan, stage, "platform")
+		if !ok {
+			platform = filepath.Join(plan.Project.Root, "build", "darwin")
+		}
+		darwinPlatform = platform
+	default:
+		return nil, fmt.Errorf("stage %s has unsupported bundle target %q", stage.Reference(), stage.Target.Platform)
 	}
 	macOS := filepath.Join(bundle, "Contents", "MacOS")
 	resources := filepath.Join(bundle, "Contents", "Resources")
@@ -770,14 +989,14 @@ func bundleAssembleActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]b
 			Kind:        buildsystem.ActionCopy,
 			Description: "Install the macOS application property list",
 			Status:      "planned",
-			Source:      filepath.Join(platform, "Info.plist"),
+			Source:      filepath.Join(darwinPlatform, "Info.plist"),
 			Destination: filepath.Join(bundle, "Contents", "Info.plist"),
 		},
 		{
 			Kind:        buildsystem.ActionCopy,
 			Description: "Install the macOS application icon bundle",
 			Status:      "planned",
-			Source:      filepath.Join(platform, "icons.icns"),
+			Source:      filepath.Join(darwinPlatform, "icons.icns"),
 			Destination: filepath.Join(resources, "icons.icns"),
 		},
 		{
@@ -815,6 +1034,7 @@ func packageCreateActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]bu
 		if stage.Target.Platform != "linux" {
 			return nil, fmt.Errorf("package format %q is only supported for Linux targets", format)
 		}
+		input = bundledExecutable(input, stage.Target.Platform, plan.Project.BinaryName)
 		return append(actions, internalBuildActionWithParameters(
 			"package.linux",
 			"Create a Linux distribution package with nfpm",
@@ -831,6 +1051,7 @@ func packageCreateActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]bu
 		if stage.Target.Platform != "windows" {
 			return nil, fmt.Errorf("package format %q is only supported for Windows targets", format)
 		}
+		input = bundledExecutable(input, stage.Target.Platform, plan.Project.BinaryName)
 		define := "ARG_WAILS_" + strings.ToUpper(stage.Target.Arch) + "_BINARY"
 		actions = append(actions, buildsystem.Action{
 			Kind:             buildsystem.ActionCommand,
@@ -863,8 +1084,89 @@ func packageCreateActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]bu
 			)
 		}
 		return actions, nil
+	case "msix":
+		if stage.Target.Platform != "windows" {
+			return nil, fmt.Errorf("package format %q is only supported for Windows targets", format)
+		}
+		return append(actions,
+			buildsystem.Action{
+				Kind: buildsystem.ActionCopy, Description: "Install the MSIX application manifest", Status: "planned",
+				Source: filepath.Join(plan.Project.Root, "build", "windows", "AppxManifest.xml"), Destination: filepath.Join(input, "AppxManifest.xml"),
+			},
+			buildsystem.Action{
+				Kind: buildsystem.ActionCommand, Description: "Create the Windows MSIX package", Status: "planned",
+				Command: []string{"makeappx.exe", "pack", "/d", input, "/p", output, "/o"}, WorkingDirectory: plan.Project.Root,
+			},
+		), nil
+	case "appimage":
+		if stage.Target.Platform != "linux" {
+			return nil, fmt.Errorf("package format %q is only supported for Linux targets", format)
+		}
+		return append(actions, buildsystem.Action{
+			Kind: buildsystem.ActionCommand, Description: "Create the Linux AppImage", Status: "planned",
+			Command: []string{"appimagetool", input, output}, WorkingDirectory: plan.Project.Root,
+		}), nil
+	case "dmg":
+		if stage.Target.Platform != "darwin" {
+			return nil, fmt.Errorf("package format %q is only supported for macOS targets", format)
+		}
+		return append(actions, buildsystem.Action{
+			Kind: buildsystem.ActionCommand, Description: "Create the macOS disk image", Status: "planned",
+			Command: []string{"hdiutil", "create", "-volname", plan.Project.Name, "-srcfolder", input, "-ov", "-format", "UDZO", output}, WorkingDirectory: plan.Project.Root,
+		}), nil
+	case "pkg":
+		if stage.Target.Platform != "darwin" {
+			return nil, fmt.Errorf("package format %q is only supported for macOS targets", format)
+		}
+		return append(actions, buildsystem.Action{
+			Kind: buildsystem.ActionCommand, Description: "Create the macOS installer package", Status: "planned",
+			Command: []string{"productbuild", "--component", input, "/Applications", output}, WorkingDirectory: plan.Project.Root,
+		}), nil
+	case "apk", "aab":
+		if stage.Target.Platform != "android" {
+			return nil, fmt.Errorf("package format %q is only supported for Android targets", format)
+		}
+		gradleTask := "assembleRelease"
+		generated := filepath.Join(input, "app", "build", "outputs", "apk", "release", "app-release.apk")
+		if format == "aab" {
+			gradleTask = "bundleRelease"
+			generated = filepath.Join(input, "app", "build", "outputs", "bundle", "release", "app-release.aab")
+		}
+		return append(actions,
+			buildsystem.Action{
+				Kind: buildsystem.ActionCommand, Description: "Build the Android " + strings.ToUpper(format) + " with Gradle", Status: "planned",
+				Command: []string{"/bin/sh", "-c", "chmod +x ./gradlew && ./gradlew " + gradleTask}, WorkingDirectory: input,
+			},
+			buildsystem.Action{Kind: buildsystem.ActionCopy, Description: "Collect the Android package", Status: "planned", Source: generated, Destination: output},
+		), nil
+	case "ipa":
+		if stage.Target.Platform != "ios" {
+			return nil, fmt.Errorf("package format %q is only supported for iOS targets", format)
+		}
+		payload := filepath.Join(plan.Project.Root, ".wails", "build", "package", buildsystem.SafeInstanceName(stage.Reference()), "Payload")
+		return append(actions,
+			buildsystem.Action{Kind: buildsystem.ActionRemove, Description: "Remove the previous iOS package staging directory", Status: "planned", Recursive: true, Path: filepath.Dir(payload)},
+			buildsystem.Action{Kind: buildsystem.ActionMkdir, Description: "Create the iOS Payload directory", Status: "planned", Path: payload},
+			buildsystem.Action{Kind: buildsystem.ActionCopy, Description: "Stage the iOS application bundle", Status: "planned", Recursive: true, Source: input, Destination: filepath.Join(payload, filepath.Base(input))},
+			internalBuildActionWithParameters("package.zip", "Create the iOS IPA archive", map[string]string{"input": payload, "output": output}),
+			buildsystem.Action{Kind: buildsystem.ActionRemove, Description: "Remove the iOS package staging directory", Status: "planned", Finally: true, Recursive: true, Path: filepath.Dir(payload)},
+		), nil
 	default:
 		return nil, fmt.Errorf("unsupported package format %q for %s", format, stage.Target.Platform)
+	}
+}
+
+func bundledExecutable(bundle, platform, name string) string {
+	switch platform {
+	case "windows":
+		if !strings.EqualFold(filepath.Ext(name), ".exe") {
+			name += ".exe"
+		}
+		return filepath.Join(bundle, name)
+	case "linux":
+		return filepath.Join(bundle, "usr", "bin", name)
+	default:
+		return bundle
 	}
 }
 
@@ -877,7 +1179,11 @@ func signingActions(
 		return nil, fmt.Errorf("stage %s has an invalid signing contract", stage.Reference())
 	}
 	parameters := signingParameters(options)
-	parameters["input"] = absoluteArtifactPath(plan.Project.Root, stage.Inputs[0])
+	input := absoluteArtifactPath(plan.Project.Root, stage.Inputs[0])
+	if stage.Target != nil && stage.Inputs[0].Type == "application-bundle" && stage.Target.Platform == "windows" {
+		input = bundledExecutable(input, "windows", plan.Project.BinaryName)
+	}
+	parameters["input"] = input
 	return []buildsystem.Action{internalBuildActionWithParameters(
 		"artifact.sign",
 		"Sign the resolved build artifact",
@@ -970,6 +1276,9 @@ func resolvePipelineSigningOptions(plan *buildsystem.Plan, provided *flags.Sign)
 	if result.Role == "" {
 		result.Role = plan.Signing.Linux.Role
 	}
+	if plan.Signing.Credentials.Provider == "environment" {
+		resolveEnvironmentSigningOptions(result, plan.Signing.Credentials.Prefix)
+	}
 	resolveSigningDefaults(result)
 	result.Entitlements = absoluteConfiguredPath(plan.Project.Root, result.Entitlements)
 	result.Certificate = absoluteConfiguredPath(plan.Project.Root, result.Certificate)
@@ -979,6 +1288,26 @@ func resolvePipelineSigningOptions(plan *buildsystem.Plan, provided *flags.Sign)
 		result.Notarize = false
 	}
 	return result
+}
+
+func resolveEnvironmentSigningOptions(options *flags.Sign, prefix string) {
+	if prefix == "" {
+		prefix = "WAILS_SIGN_"
+	}
+	values := []struct {
+		value *string
+		name  string
+	}{
+		{&options.Certificate, "CERTIFICATE"}, {&options.Thumbprint, "THUMBPRINT"},
+		{&options.Timestamp, "TIMESTAMP"}, {&options.Identity, "IDENTITY"},
+		{&options.Entitlements, "ENTITLEMENTS"}, {&options.KeychainProfile, "KEYCHAIN_PROFILE"},
+		{&options.PGPKey, "PGP_KEY"}, {&options.Role, "ROLE"},
+	}
+	for _, candidate := range values {
+		if *candidate.value == "" {
+			*candidate.value = os.Getenv(prefix + candidate.name)
+		}
+	}
 }
 
 func absoluteConfiguredPath(root, path string) string {
@@ -1024,6 +1353,11 @@ func stageInputPath(plan *buildsystem.Plan, stage buildsystem.Stage, name string
 	return "", fmt.Errorf("stage %s has no input artifact %q", stage.Reference(), name)
 }
 
+func optionalStageInputPath(plan *buildsystem.Plan, stage buildsystem.Stage, name string) (string, bool) {
+	path, err := stageInputPath(plan, stage, name)
+	return path, err == nil
+}
+
 func planTags(plan *buildsystem.Plan) []string {
 	var tags []string
 	for _, target := range plan.Targets {
@@ -1038,14 +1372,17 @@ func planTags(plan *buildsystem.Plan) []string {
 
 func buildInternalActions(_ *flags.Build) map[string]buildsystem.ActionFunc {
 	return map[string]buildsystem.ActionFunc{
-		"bindings.generate":      generateBindingsAction,
-		"assets.generate-icons":  generateIconsAction,
-		"platform.generate-syso": generateSysoAction,
-		"binary.combine":         combineBinaryAction,
-		"package.zip":            createZipPackageAction,
-		"package.linux":          createLinuxPackageAction,
-		"artifact.sign":          signArtifactAction,
-		"artifact.notarize":      notarizeArtifactAction,
+		"bindings.generate":             generateBindingsAction,
+		"assets.generate-icons":         generateIconsAction,
+		"platform.generate-syso":        generateSysoAction,
+		"platform.generate-android":     AndroidPlatformAction,
+		"platform.generate-ios-overlay": IOSOverlayPlatformAction,
+		"platform.generate-ios-xcode":   IOSXcodePlatformAction,
+		"binary.combine":                combineBinaryAction,
+		"package.zip":                   createZipPackageAction,
+		"package.linux":                 createLinuxPackageAction,
+		"artifact.sign":                 signArtifactAction,
+		"artifact.notarize":             notarizeArtifactAction,
 		"native.compile": func(
 			context.Context,
 			*buildsystem.StageContext,
@@ -1055,6 +1392,30 @@ func buildInternalActions(_ *flags.Build) map[string]buildsystem.ActionFunc {
 		},
 		"artifacts.collect": collectArtifactsAction,
 	}
+}
+
+func AndroidPlatformAction(
+	_ context.Context,
+	_ *buildsystem.StageContext,
+	action buildsystem.Action,
+) error {
+	return AndroidOverlayGen(&AndroidOverlayGenOptions{Out: action.Parameters["output"], Config: action.Parameters["config"]})
+}
+
+func IOSOverlayPlatformAction(
+	_ context.Context,
+	_ *buildsystem.StageContext,
+	action buildsystem.Action,
+) error {
+	return IOSOverlayGen(&IOSOverlayGenOptions{Out: action.Parameters["output"], Config: action.Parameters["config"]})
+}
+
+func IOSXcodePlatformAction(
+	_ context.Context,
+	_ *buildsystem.StageContext,
+	action buildsystem.Action,
+) error {
+	return IOSXcodeGen(&IOSXcodeGenOptions{OutDir: action.Parameters["output"], Config: action.Parameters["config"]})
 }
 
 func combineBinaryAction(
