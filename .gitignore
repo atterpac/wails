@@ -17,6 +17,7 @@ cmd/wails/wails
 .DS_Store
 tmp
 node_modules/
+.wails/
 package.json.md5
 v2/test/**/frontend/dist
 v2/test/**/build/
@@ -85,6 +86,7 @@ v2/cmd/wails/internal/commands/initialise/templates/testtemplates/
 /v3/examples/*/app
 /v3/examples/*/changeme
 /v3/examples/*/testbuild-*
+/v3/examples/*/bin/
 
 # Temporary called mkdocs, should be renamed to more standard -website or similar
 /docs/site
