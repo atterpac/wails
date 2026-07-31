@@ -8,10 +8,10 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/wailsapp/wails/v3/internal/buildsystem"
@@ -32,16 +32,19 @@ func executeBuildPipeline(buildFlags *flags.Build, otherArgs []string, step stri
 	if err != nil {
 		return err
 	}
+	if err := resolveBuildActions(plan, buildFlags); err != nil {
+		return err
+	}
 
 	term.Header("Build Pipeline")
 	DisableFooter = true
 	return buildsystem.Execute(context.Background(), plan, buildsystem.ExecuteOptions{
-		From:     buildFlags.From,
-		Until:    buildFlags.Until,
-		Step:     step,
-		Stdout:   os.Stdout,
-		Stderr:   os.Stderr,
-		Builtins: buildStageImplementations(buildFlags),
+		From:            buildFlags.From,
+		Until:           buildFlags.Until,
+		Step:            step,
+		Stdout:          os.Stdout,
+		Stderr:          os.Stderr,
+		InternalActions: buildInternalActions(buildFlags),
 		OnStage: func(stage buildsystem.Stage, status string) {
 			switch status {
 			case "running":
@@ -55,59 +58,474 @@ func executeBuildPipeline(buildFlags *flags.Build, otherArgs []string, step stri
 	})
 }
 
-func buildStageImplementations(buildFlags *flags.Build) map[string]buildsystem.StageFunc {
-	return map[string]buildsystem.StageFunc{
-		"project.resolve":      resolveProjectStage,
-		"toolchain.check":      checkToolchainStage,
-		"dependencies.prepare": prepareDependenciesStage,
-		"bindings.generate":    generateBindingsStage(buildFlags),
-		"assets.generate":      generateAssetsStage,
-		"frontend.build":       buildFrontendStage,
-		"platform.generate":    generatePlatformStage,
-		"native.compile":       compileNativeStage(buildFlags),
-		"artifacts.collect":    collectArtifactsStage,
-	}
-}
+func resolveBuildActions(plan *buildsystem.Plan, buildFlags *flags.Build) error {
+	for index := range plan.Stages {
+		stage := &plan.Stages[index]
+		if stage.Status == "skipped" || stage.Replacement != nil {
+			continue
+		}
 
-func resolveProjectStage(_ context.Context, stage *buildsystem.StageContext) error {
-	return os.MkdirAll(filepath.Join(stage.Plan.Project.Root, ".wails", "build"), 0o755)
-}
-
-func checkToolchainStage(ctx context.Context, stage *buildsystem.StageContext) error {
-	required := []string{"go"}
-	if _, err := os.Stat(filepath.Join(stage.Plan.Project.Root, stage.Plan.Project.Frontend, "package.json")); err == nil {
-		required = append(required, stage.Plan.Project.PackageManager)
-	}
-	if stage.Plan.Target.Platform == "linux" || stage.Plan.Target.Platform == "darwin" {
-		required = append(required, "cc")
-	}
-	for _, tool := range required {
-		if _, err := exec.LookPath(tool); err != nil {
-			return fmt.Errorf("required tool %q was not found in PATH", tool)
+		switch stage.ID {
+		case "project.resolve":
+			stage.Actions = []buildsystem.Action{{
+				Kind:        buildsystem.ActionMkdir,
+				Description: "Create the generated build workspace",
+				Status:      "planned",
+				Path:        filepath.Join(plan.Project.Root, ".wails", "build"),
+			}}
+		case "toolchain.check":
+			stage.Actions = toolchainActions(plan)
+		case "dependencies.prepare":
+			stage.Actions = dependencyActions(plan)
+		case "bindings.generate":
+			output, err := planStageOutputPath(plan, *stage, "bindings")
+			if err != nil {
+				return err
+			}
+			stage.Actions = []buildsystem.Action{internalBuildActionWithParameters(
+				"bindings.generate",
+				"Generate frontend bindings from the application Go packages",
+				map[string]string{
+					"buildFlags": "-tags " + strings.Join(plan.Target.Tags, ","),
+					"clean":      "true",
+					"index":      "index",
+					"models":     "models",
+					"obfuscated": fmt.Sprint(buildFlags.Obfuscated),
+					"output":     output,
+					"timeType":   "Date",
+					"typescript": fmt.Sprint(fileExists(filepath.Join(
+						plan.Project.Root,
+						plan.Project.Frontend,
+						"tsconfig.json",
+					))),
+				},
+			)}
+		case "assets.generate":
+			actions, err := assetActions(plan, *stage)
+			if err != nil {
+				return err
+			}
+			stage.Actions = actions
+		case "frontend.build":
+			stage.Actions = []buildsystem.Action{{
+				Kind:             buildsystem.ActionCommand,
+				Description:      "Build the production frontend distribution",
+				Status:           "planned",
+				Command:          []string{plan.Project.PackageManager, "run", "build"},
+				WorkingDirectory: filepath.Join(plan.Project.Root, plan.Project.Frontend),
+				Environment:      map[string]string{"PRODUCTION": "true"},
+			}}
+		case "platform.generate":
+			actions, err := platformActions(plan, *stage)
+			if err != nil {
+				return err
+			}
+			stage.Actions = actions
+		case "native.compile":
+			actions, err := nativeCompileActions(plan, *stage, buildFlags)
+			if err != nil {
+				return err
+			}
+			stage.Actions = actions
+		case "artifacts.collect":
+			binary, err := planArtifactPath(plan, "binary")
+			if err != nil {
+				return err
+			}
+			manifest, err := planStageOutputPath(plan, *stage, "manifest")
+			if err != nil {
+				return err
+			}
+			stage.Actions = []buildsystem.Action{internalBuildActionWithParameters(
+				"artifacts.collect",
+				"Hash the native binary and write the artifact manifest",
+				map[string]string{
+					"binary":   binary,
+					"manifest": manifest,
+				},
+			)}
 		}
 	}
-	if stage.Plan.Target.Platform == "linux" && runtime.GOOS == "linux" {
-		if err := runPipelineCommand(ctx, stage, nil, "pkg-config", "--exists", "gtk4", "webkitgtk-6.0"); err != nil {
-			return fmt.Errorf("GTK4 and WebKitGTK 6.0 development packages are required: %w", err)
-		}
-	}
+	addActionContextEnvironment(plan)
 	return nil
 }
 
-func prepareDependenciesStage(ctx context.Context, stage *buildsystem.StageContext) error {
-	if err := runPipelineCommand(ctx, stage, nil, "go", "mod", "download"); err != nil {
-		return err
+func toolchainActions(plan *buildsystem.Plan) []buildsystem.Action {
+	tools := []string{"go"}
+	if fileExists(filepath.Join(plan.Project.Root, plan.Project.Frontend, "package.json")) {
+		tools = append(tools, plan.Project.PackageManager)
 	}
+	if plan.Target.Platform == "linux" || plan.Target.Platform == "darwin" {
+		tools = append(tools, "cc")
+	}
+	actions := make([]buildsystem.Action, 0, len(tools)+1)
+	for _, tool := range tools {
+		actions = append(actions, buildsystem.Action{
+			Kind:        buildsystem.ActionCheckTool,
+			Description: "Check that " + tool + " is available",
+			Status:      "planned",
+			Tool:        tool,
+		})
+	}
+	if plan.Target.Platform == "linux" && runtime.GOOS == "linux" {
+		actions = append(actions, buildsystem.Action{
+			Kind:             buildsystem.ActionCommand,
+			Description:      "Check Linux GUI development packages",
+			Status:           "planned",
+			Command:          []string{"pkg-config", "--exists", "gtk4", "webkitgtk-6.0"},
+			WorkingDirectory: plan.Project.Root,
+		})
+	}
+	return actions
+}
 
-	frontend := filepath.Join(stage.Plan.Project.Root, stage.Plan.Project.Frontend)
+func assetActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]buildsystem.Action, error) {
+	output, err := planStageOutputPath(plan, stage, "assets")
+	if err != nil {
+		return nil, err
+	}
+	input := filepath.Join(plan.Project.Root, "build", "appicon.png")
+	actions := []buildsystem.Action{{
+		Kind:        buildsystem.ActionMkdir,
+		Description: "Create the generated asset directory",
+		Status:      "planned",
+		Path:        output,
+	}}
+	switch plan.Target.Platform {
+	case "windows":
+		return append(actions, internalBuildActionWithParameters(
+			"assets.generate-icons",
+			"Encode the application icon as a Windows icon",
+			map[string]string{
+				"input":  input,
+				"target": "windows",
+				"output": filepath.Join(output, "icon.ico"),
+				"sizes":  "256,128,64,48,32,16",
+			},
+		)), nil
+	case "darwin":
+		return append(actions, internalBuildActionWithParameters(
+			"assets.generate-icons",
+			"Encode the application icon as a macOS icon bundle",
+			map[string]string{
+				"input":  input,
+				"target": "darwin",
+				"output": filepath.Join(output, "icons.icns"),
+			},
+		)), nil
+	default:
+		return append(actions, buildsystem.Action{
+			Kind:        buildsystem.ActionCopy,
+			Description: "Copy the application icon into generated assets",
+			Status:      "planned",
+			Source:      input,
+			Destination: filepath.Join(output, "appicon.png"),
+		}), nil
+	}
+}
+
+func platformActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]buildsystem.Action, error) {
+	output, err := planStageOutputPath(plan, stage, "platform")
+	if err != nil {
+		return nil, err
+	}
+	actions := []buildsystem.Action{{
+		Kind:        buildsystem.ActionMkdir,
+		Description: "Create the generated platform resource directory",
+		Status:      "planned",
+		Path:        output,
+	}}
+	switch plan.Target.Platform {
+	case "windows":
+		assets, err := planArtifactPath(plan, "assets")
+		if err != nil {
+			return nil, err
+		}
+		return append(actions, internalBuildActionWithParameters(
+			"platform.generate-syso",
+			"Generate the Windows resource object",
+			map[string]string{
+				"arch":     plan.Target.Arch,
+				"icon":     filepath.Join(assets, "icon.ico"),
+				"info":     filepath.Join(plan.Project.Root, "build", "windows", "info.json"),
+				"manifest": filepath.Join(plan.Project.Root, "build", "windows", "wails.exe.manifest"),
+				"output":   filepath.Join(output, "rsrc_windows_"+plan.Target.Arch+".syso"),
+			},
+		)), nil
+	case "darwin":
+		assets, err := planArtifactPath(plan, "assets")
+		if err != nil {
+			return nil, err
+		}
+		return append(actions,
+			buildsystem.Action{
+				Kind:        buildsystem.ActionCopy,
+				Description: "Copy the macOS application property list",
+				Status:      "planned",
+				Source:      filepath.Join(plan.Project.Root, "build", "darwin", "Info.plist"),
+				Destination: filepath.Join(output, "Info.plist"),
+			},
+			buildsystem.Action{
+				Kind:        buildsystem.ActionCopy,
+				Description: "Copy the macOS application icon bundle",
+				Status:      "planned",
+				Source:      filepath.Join(assets, "icons.icns"),
+				Destination: filepath.Join(output, "icons.icns"),
+			},
+		), nil
+	default:
+		return actions, nil
+	}
+}
+
+func addActionContextEnvironment(plan *buildsystem.Plan) {
+	for stageIndex := range plan.Stages {
+		stage := &plan.Stages[stageIndex]
+		contextPath := filepath.Join(
+			plan.Project.Root,
+			".wails",
+			"build",
+			"context",
+			strings.ReplaceAll(stage.ID, ".", "-")+".json",
+		)
+		for actionIndex := range stage.Actions {
+			action := &stage.Actions[actionIndex]
+			if action.Kind != buildsystem.ActionCommand {
+				continue
+			}
+			if action.Environment == nil {
+				action.Environment = make(map[string]string)
+			}
+			action.Environment["WAILS_BUILD_STAGE"] = stage.ID
+			action.Environment["WAILS_BUILD_CONTEXT"] = contextPath
+		}
+	}
+}
+
+func dependencyActions(plan *buildsystem.Plan) []buildsystem.Action {
+	actions := []buildsystem.Action{{
+		Kind:             buildsystem.ActionCommand,
+		Description:      "Download Go module dependencies",
+		Status:           "planned",
+		Command:          []string{"go", "mod", "download"},
+		WorkingDirectory: plan.Project.Root,
+	}}
+
+	frontend := filepath.Join(plan.Project.Root, plan.Project.Frontend)
 	if _, err := os.Stat(filepath.Join(frontend, "package.json")); os.IsNotExist(err) {
-		return nil
+		return actions
+	}
+	name, args := frontendInstallCommand(frontend, plan.Project.PackageManager)
+	action := buildsystem.Action{
+		Kind:             buildsystem.ActionCommand,
+		Description:      "Install frontend dependencies",
+		Status:           "planned",
+		Command:          append([]string{name}, args...),
+		WorkingDirectory: frontend,
 	}
 	if frontendDependenciesExist(frontend) {
-		return nil
+		action.Status = "skipped"
+		action.Reason = "frontend dependencies are already installed"
 	}
-	name, args := frontendInstallCommand(frontend, stage.Plan.Project.PackageManager)
-	return runPipelineCommand(ctx, stage, nil, name, args...)
+	return append(actions, action)
+}
+
+func nativeCompileActions(
+	plan *buildsystem.Plan,
+	stage buildsystem.Stage,
+	buildFlags *flags.Build,
+) ([]buildsystem.Action, error) {
+	if buildFlags.Obfuscated {
+		return []buildsystem.Action{internalBuildAction(
+			"native.compile",
+			"Compile the obfuscated native application",
+		)}, nil
+	}
+
+	output, err := planStageOutputPath(plan, stage, "binary")
+	if err != nil {
+		return nil, err
+	}
+	actions := []buildsystem.Action{{
+		Kind:        buildsystem.ActionMkdir,
+		Description: "Create the binary output directory",
+		Status:      "planned",
+		Path:        filepath.Dir(output),
+	}}
+
+	var temporaryResource string
+	if plan.Target.Platform == "windows" {
+		platform, err := planArtifactPath(plan, "platform")
+		if err != nil {
+			return nil, err
+		}
+		name := "rsrc_windows_" + plan.Target.Arch + ".syso"
+		temporaryResource = filepath.Join(plan.Project.Root, name)
+		actions = append(actions, buildsystem.Action{
+			Kind:        buildsystem.ActionCopy,
+			Description: "Install the generated Windows resource for Go compilation",
+			Status:      "planned",
+			Source:      filepath.Join(platform, name),
+			Destination: temporaryResource,
+		})
+	}
+
+	command := []string{"go", "build"}
+	if len(plan.Target.Tags) > 0 {
+		command = append(command, "-tags", strings.Join(plan.Target.Tags, ","))
+	}
+	command = append(command, "-trimpath", "-buildvcs=false", "-ldflags=-w -s", "-o", output)
+	environment := map[string]string{
+		"GOOS":   plan.Target.Platform,
+		"GOARCH": plan.Target.Arch,
+	}
+	if slices.Contains([]string{"linux", "darwin"}, plan.Target.Platform) {
+		environment["CGO_ENABLED"] = "1"
+	} else {
+		environment["CGO_ENABLED"] = "0"
+	}
+	if plan.Target.Platform == "darwin" {
+		environment["CGO_CFLAGS"] = "-mmacosx-version-min=12.0"
+		environment["CGO_LDFLAGS"] = "-mmacosx-version-min=12.0"
+		environment["MACOSX_DEPLOYMENT_TARGET"] = "12.0"
+	}
+	actions = append(actions, buildsystem.Action{
+		Kind:             buildsystem.ActionCommand,
+		Description:      "Compile the native application binary",
+		Status:           "planned",
+		Command:          command,
+		WorkingDirectory: plan.Project.Root,
+		Environment:      environment,
+	})
+	if temporaryResource != "" {
+		actions = append(actions, buildsystem.Action{
+			Kind:        buildsystem.ActionRemove,
+			Description: "Remove the temporary Windows resource",
+			Status:      "planned",
+			Finally:     true,
+			Path:        temporaryResource,
+		})
+	}
+	return actions, nil
+}
+
+func internalBuildAction(name, description string) buildsystem.Action {
+	return internalBuildActionWithParameters(name, description, nil)
+}
+
+func internalBuildActionWithParameters(
+	name string,
+	description string,
+	parameters map[string]string,
+) buildsystem.Action {
+	return buildsystem.Action{
+		Kind:        buildsystem.ActionInternal,
+		Description: description,
+		Status:      "planned",
+		Internal:    name,
+		Parameters:  parameters,
+	}
+}
+
+func planStageOutputPath(plan *buildsystem.Plan, stage buildsystem.Stage, name string) (string, error) {
+	for _, artifact := range stage.Outputs {
+		if artifact.Name == name {
+			return absoluteArtifactPath(plan.Project.Root, artifact), nil
+		}
+	}
+	return "", fmt.Errorf("stage %s has no output artifact %q", stage.ID, name)
+}
+
+func planArtifactPath(plan *buildsystem.Plan, name string) (string, error) {
+	for _, stage := range plan.Stages {
+		for _, artifact := range stage.Outputs {
+			if artifact.Name == name {
+				return absoluteArtifactPath(plan.Project.Root, artifact), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("build plan has no artifact %q", name)
+}
+
+func buildInternalActions(_ *flags.Build) map[string]buildsystem.ActionFunc {
+	return map[string]buildsystem.ActionFunc{
+		"bindings.generate":      generateBindingsAction,
+		"assets.generate-icons":  generateIconsAction,
+		"platform.generate-syso": generateSysoAction,
+		"native.compile": func(
+			context.Context,
+			*buildsystem.StageContext,
+			buildsystem.Action,
+		) error {
+			return fmt.Errorf("obfuscated builds are not yet supported by the typed executor")
+		},
+		"artifacts.collect": collectArtifactsAction,
+	}
+}
+
+func generateBindingsAction(
+	_ context.Context,
+	stage *buildsystem.StageContext,
+	action buildsystem.Action,
+) error {
+	typescript, err := strconv.ParseBool(action.Parameters["typescript"])
+	if err != nil {
+		return fmt.Errorf("parse bindings typescript setting: %w", err)
+	}
+	obfuscated, err := strconv.ParseBool(action.Parameters["obfuscated"])
+	if err != nil {
+		return fmt.Errorf("parse bindings obfuscated setting: %w", err)
+	}
+	clean, err := strconv.ParseBool(action.Parameters["clean"])
+	if err != nil {
+		return fmt.Errorf("parse bindings clean setting: %w", err)
+	}
+	options := &flags.GenerateBindingsOptions{
+		BuildFlagsString: action.Parameters["buildFlags"],
+		OutputDirectory:  action.Parameters["output"],
+		ModelsFilename:   action.Parameters["models"],
+		IndexFilename:    action.Parameters["index"],
+		TimeType:         action.Parameters["timeType"],
+		TS:               typescript,
+		Obfuscated:       obfuscated,
+		Clean:            clean,
+		Silent:           true,
+	}
+	return GenerateBindings(options, []string{"."})
+}
+
+func generateIconsAction(
+	_ context.Context,
+	_ *buildsystem.StageContext,
+	action buildsystem.Action,
+) error {
+	options := &IconsOptions{
+		Input: action.Parameters["input"],
+		Sizes: action.Parameters["sizes"],
+	}
+	switch action.Parameters["target"] {
+	case "windows":
+		options.WindowsFilename = action.Parameters["output"]
+	case "darwin":
+		options.MacFilename = action.Parameters["output"]
+	default:
+		return fmt.Errorf("unsupported icon target %q", action.Parameters["target"])
+	}
+	return GenerateIcons(options)
+}
+
+func generateSysoAction(
+	_ context.Context,
+	_ *buildsystem.StageContext,
+	action buildsystem.Action,
+) error {
+	return GenerateSyso(&SysoOptions{
+		Manifest: action.Parameters["manifest"],
+		Info:     action.Parameters["info"],
+		Icon:     action.Parameters["icon"],
+		Out:      action.Parameters["output"],
+		Arch:     action.Parameters["arch"],
+	})
 }
 
 func frontendDependenciesExist(frontend string) bool {
@@ -143,155 +561,6 @@ func frontendInstallCommand(frontend, packageManager string) (string, []string) 
 	return packageManager, []string{"install"}
 }
 
-func generateBindingsStage(buildFlags *flags.Build) buildsystem.StageFunc {
-	return func(_ context.Context, stage *buildsystem.StageContext) error {
-		output, err := stageArtifactPath(stage, "bindings")
-		if err != nil {
-			return err
-		}
-		tags := strings.Join(stage.Plan.Target.Tags, ",")
-		options := &flags.GenerateBindingsOptions{
-			BuildFlagsString: "-tags " + tags,
-			OutputDirectory:  output,
-			ModelsFilename:   "models",
-			IndexFilename:    "index",
-			TimeType:         "Date",
-			TS:               fileExists(filepath.Join(stage.Plan.Project.Root, stage.Plan.Project.Frontend, "tsconfig.json")),
-			Obfuscated:       buildFlags.Obfuscated,
-			Clean:            true,
-			Silent:           true,
-		}
-		return GenerateBindings(options, []string{"."})
-	}
-}
-
-func generateAssetsStage(_ context.Context, stage *buildsystem.StageContext) error {
-	output, err := stageArtifactPath(stage, "assets")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(output, 0o755); err != nil {
-		return err
-	}
-	input := filepath.Join(stage.Plan.Project.Root, "build", "appicon.png")
-	if !fileExists(input) {
-		return fmt.Errorf("application icon not found at %s", input)
-	}
-	switch stage.Plan.Target.Platform {
-	case "windows":
-		return GenerateIcons(&IconsOptions{
-			Input:           input,
-			WindowsFilename: filepath.Join(output, "icon.ico"),
-		})
-	case "darwin":
-		return GenerateIcons(&IconsOptions{
-			Input:       input,
-			MacFilename: filepath.Join(output, "icons.icns"),
-		})
-	default:
-		return copyPipelineFile(input, filepath.Join(output, "appicon.png"))
-	}
-}
-
-func buildFrontendStage(ctx context.Context, stage *buildsystem.StageContext) error {
-	frontend := filepath.Join(stage.Plan.Project.Root, stage.Plan.Project.Frontend)
-	if _, err := os.Stat(filepath.Join(frontend, "package.json")); os.IsNotExist(err) {
-		return fmt.Errorf("frontend package.json not found in %s", frontend)
-	}
-	return runPipelineCommand(ctx, stage, []string{"PRODUCTION=true"}, stage.Plan.Project.PackageManager, "run", "build")
-}
-
-func generatePlatformStage(_ context.Context, stage *buildsystem.StageContext) error {
-	output, err := stageArtifactPath(stage, "platform")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(output, 0o755); err != nil {
-		return err
-	}
-	switch stage.Plan.Target.Platform {
-	case "windows":
-		assets, err := artifactPath(stage, "assets")
-		if err != nil {
-			return err
-		}
-		return GenerateSyso(&SysoOptions{
-			Manifest: filepath.Join(stage.Plan.Project.Root, "build", "windows", "wails.exe.manifest"),
-			Info:     filepath.Join(stage.Plan.Project.Root, "build", "windows", "info.json"),
-			Icon:     filepath.Join(assets, "icon.ico"),
-			Out:      filepath.Join(output, "rsrc_windows_"+stage.Plan.Target.Arch+".syso"),
-			Arch:     stage.Plan.Target.Arch,
-		})
-	case "darwin":
-		assets, err := artifactPath(stage, "assets")
-		if err != nil {
-			return err
-		}
-		if err := copyPipelineFile(
-			filepath.Join(stage.Plan.Project.Root, "build", "darwin", "Info.plist"),
-			filepath.Join(output, "Info.plist"),
-		); err != nil {
-			return err
-		}
-		return copyPipelineFile(filepath.Join(assets, "icons.icns"), filepath.Join(output, "icons.icns"))
-	default:
-		return nil
-	}
-}
-
-func compileNativeStage(buildFlags *flags.Build) buildsystem.StageFunc {
-	return func(ctx context.Context, stage *buildsystem.StageContext) error {
-		if buildFlags.Obfuscated {
-			return fmt.Errorf("obfuscated builds are not yet supported by the typed executor")
-		}
-		output, err := stageArtifactPath(stage, "binary")
-		if err != nil {
-			return err
-		}
-		if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil {
-			return err
-		}
-
-		var cleanup func()
-		if stage.Plan.Target.Platform == "windows" {
-			platform, err := artifactPath(stage, "platform")
-			if err != nil {
-				return err
-			}
-			name := "rsrc_windows_" + stage.Plan.Target.Arch + ".syso"
-			temporary := filepath.Join(stage.Plan.Project.Root, name)
-			if err := copyPipelineFile(filepath.Join(platform, name), temporary); err != nil {
-				return err
-			}
-			cleanup = func() { _ = os.Remove(temporary) }
-			defer cleanup()
-		}
-
-		args := []string{"build"}
-		if len(stage.Plan.Target.Tags) > 0 {
-			args = append(args, "-tags", strings.Join(stage.Plan.Target.Tags, ","))
-		}
-		args = append(args, "-trimpath", "-buildvcs=false", "-ldflags=-w -s", "-o", output)
-		environment := []string{
-			"GOOS=" + stage.Plan.Target.Platform,
-			"GOARCH=" + stage.Plan.Target.Arch,
-		}
-		if slices.Contains([]string{"linux", "darwin"}, stage.Plan.Target.Platform) {
-			environment = append(environment, "CGO_ENABLED=1")
-		} else {
-			environment = append(environment, "CGO_ENABLED=0")
-		}
-		if stage.Plan.Target.Platform == "darwin" {
-			environment = append(environment,
-				"CGO_CFLAGS=-mmacosx-version-min=12.0",
-				"CGO_LDFLAGS=-mmacosx-version-min=12.0",
-				"MACOSX_DEPLOYMENT_TARGET=12.0",
-			)
-		}
-		return runPipelineCommand(ctx, stage, environment, "go", args...)
-	}
-}
-
 type buildArtifactManifest struct {
 	Artifacts []buildArtifactEntry `json:"artifacts"`
 }
@@ -305,12 +574,16 @@ type buildArtifactEntry struct {
 	SHA256   string `json:"sha256"`
 }
 
-func collectArtifactsStage(_ context.Context, stage *buildsystem.StageContext) error {
+func collectArtifactsAction(
+	_ context.Context,
+	stage *buildsystem.StageContext,
+	action buildsystem.Action,
+) error {
 	binaryArtifact, ok := stage.Artifacts["binary"]
 	if !ok {
 		return fmt.Errorf("artifact %q is not available to stage %s", "binary", stage.Stage.ID)
 	}
-	binary := absoluteArtifactPath(stage.Plan.Project.Root, binaryArtifact)
+	binary := action.Parameters["binary"]
 	info, err := os.Stat(binary)
 	if err != nil {
 		return err
@@ -324,10 +597,7 @@ func collectArtifactsStage(_ context.Context, stage *buildsystem.StageContext) e
 	if _, err := io.Copy(hash, file); err != nil {
 		return err
 	}
-	manifestPath, err := stageArtifactPath(stage, "manifest")
-	if err != nil {
-		return err
-	}
+	manifestPath := action.Parameters["manifest"]
 	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o755); err != nil {
 		return err
 	}
@@ -346,45 +616,6 @@ func collectArtifactsStage(_ context.Context, stage *buildsystem.StageContext) e
 	return os.WriteFile(manifestPath, append(data, '\n'), 0o644)
 }
 
-func runPipelineCommand(
-	ctx context.Context,
-	stage *buildsystem.StageContext,
-	environment []string,
-	name string,
-	args ...string,
-) error {
-	command := exec.CommandContext(ctx, name, args...)
-	command.Dir = stage.Plan.Project.Root
-	if name == stage.Plan.Project.PackageManager {
-		command.Dir = filepath.Join(stage.Plan.Project.Root, stage.Plan.Project.Frontend)
-	}
-	command.Env = append(os.Environ(), environment...)
-	command.Stdout = stage.Stdout
-	command.Stderr = stage.Stderr
-	command.Stdin = os.Stdin
-	if err := command.Run(); err != nil {
-		return fmt.Errorf("%s: %w", strings.Join(append([]string{name}, args...), " "), err)
-	}
-	return nil
-}
-
-func stageArtifactPath(stage *buildsystem.StageContext, name string) (string, error) {
-	for _, artifact := range stage.Stage.Outputs {
-		if artifact.Name == name {
-			return absoluteArtifactPath(stage.Plan.Project.Root, artifact), nil
-		}
-	}
-	return "", fmt.Errorf("stage %s has no output artifact %q", stage.Stage.ID, name)
-}
-
-func artifactPath(stage *buildsystem.StageContext, name string) (string, error) {
-	artifact, ok := stage.Artifacts[name]
-	if !ok {
-		return "", fmt.Errorf("artifact %q is not available to stage %s", name, stage.Stage.ID)
-	}
-	return absoluteArtifactPath(stage.Plan.Project.Root, artifact), nil
-}
-
 func absoluteArtifactPath(root string, artifact buildsystem.Artifact) string {
 	if filepath.IsAbs(artifact.Path) {
 		return artifact.Path
@@ -395,24 +626,4 @@ func absoluteArtifactPath(root string, artifact buildsystem.Artifact) string {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
-}
-
-func copyPipelineFile(source, destination string) error {
-	input, err := os.Open(source)
-	if err != nil {
-		return err
-	}
-	defer input.Close()
-	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
-		return err
-	}
-	output, err := os.Create(destination)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(output, input); err != nil {
-		output.Close()
-		return err
-	}
-	return output.Close()
 }

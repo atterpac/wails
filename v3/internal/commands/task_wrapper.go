@@ -117,6 +117,9 @@ func printBuildPlan(buildFlags *flags.Build, otherArgs []string, step string) er
 	if err != nil {
 		return err
 	}
+	if err := resolveBuildActions(plan, buildFlags); err != nil {
+		return err
+	}
 	DisableFooter = true
 	if step != "" {
 		inspection, err := buildsystem.InspectStage(plan, step)
