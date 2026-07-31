@@ -231,6 +231,28 @@ func TestBuildJSONRequiresPlan(t *testing.T) {
 	assert.EqualError(t, err, "--json requires --plan")
 }
 
+func TestTypedPipelineCacheOptionsRouteAndPropagate(t *testing.T) {
+	packageOptions := &flags.Package{
+		NoCache: true, Resume: true, CacheDir: "cache", Report: "report.json",
+	}
+	assert.True(t, packagePipelineRequested(packageOptions))
+	packageBuild := packageBuildFlags(packageOptions)
+	assert.True(t, packageBuild.NoCache)
+	assert.True(t, packageBuild.Resume)
+	assert.Equal(t, "cache", packageBuild.CacheDir)
+	assert.Equal(t, "report.json", packageBuild.Report)
+
+	signOptions := &flags.SignWrapper{
+		NoCache: true, Resume: true, CacheDir: "sign-cache", Report: "sign-report.json",
+	}
+	assert.True(t, signingPipelineRequested(signOptions))
+	signBuild := signBuildFlags(signOptions)
+	assert.True(t, signBuild.NoCache)
+	assert.True(t, signBuild.Resume)
+	assert.Equal(t, "sign-cache", signBuild.CacheDir)
+	assert.Equal(t, "sign-report.json", signBuild.Report)
+}
+
 func TestTargetFromArgs(t *testing.T) {
 	t.Setenv("GOOS", "linux")
 	t.Setenv("GOARCH", "amd64")

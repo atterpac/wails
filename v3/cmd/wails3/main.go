@@ -51,6 +51,7 @@ func main() {
 	pkg.Action(func() error {
 		return commands.Package(&pkgFlags, pkg.OtherArgs())
 	})
+	pkg.LongDescription("\nUse --plan to inspect the typed package pipeline or --pipeline to execute it. Repeat --format and --target to select package outputs.")
 	doctorCmd := app.NewSubCommand("doctor", "System status report")
 	var doctorFlags flags.Doctor
 	doctorCmd.AddFlags(&doctorFlags)
@@ -138,6 +139,7 @@ func main() {
 	sign.Action(func() error {
 		return commands.SignWrapper(&signWrapperFlags, sign.OtherArgs())
 	})
+	sign.LongDescription("\nUse --plan to inspect the typed signing pipeline or --pipeline to execute it. --notarize enables Apple notarization and stapling.")
 
 	// Updater publishing tools (the Wails Update Manifest protocol)
 	updaterCmd := app.NewSubCommand("updater", "Self-update publishing tools (keys, signing, manifests)")

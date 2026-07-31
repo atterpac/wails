@@ -79,7 +79,8 @@ func Build(buildFlags *flags.Build, otherArgs []string) error {
 	if buildFlags.Plan {
 		return printBuildPlan(buildFlags, pipelineArgs, step)
 	}
-	if buildFlags.Pipeline || buildFlags.From != "" || buildFlags.Until != "" || step != "" {
+	if buildFlags.Pipeline || buildFlags.From != "" || buildFlags.Until != "" || step != "" ||
+		buildFlags.NoCache || buildFlags.Resume || buildFlags.CacheDir != "" || buildFlags.Report != "" {
 		return executeBuildPipeline(buildFlags, pipelineArgs, step)
 	}
 	if buildFlags.Tags != "" {
@@ -105,6 +106,16 @@ func buildStepInvocation(args []string) (string, []string, error) {
 }
 
 func printBuildPlan(buildFlags *flags.Build, otherArgs []string, step string) error {
+	return printTypedPipelinePlan(buildFlags, nil, "build", otherArgs, step)
+}
+
+func printTypedPipelinePlan(
+	buildFlags *flags.Build,
+	signOptions *flags.Sign,
+	goal string,
+	otherArgs []string,
+	step string,
+) error {
 	target, arch := targetFromArgs(otherArgs)
 	targets, err := requestedTargets(buildFlags.Targets)
 	if err != nil {
@@ -118,11 +129,13 @@ func printBuildPlan(buildFlags *flags.Build, otherArgs []string, step string) er
 		Mode:       "production",
 		Tags:       strings.Split(buildFlags.Tags, ","),
 		Obfuscated: buildFlags.Obfuscated,
+		Goal:       goal,
+		Packages:   buildFlags.Packages,
 	})
 	if err != nil {
 		return err
 	}
-	if err := resolveBuildActions(plan, buildFlags); err != nil {
+	if err := resolveTypedPipelineActions(plan, buildFlags, signOptions); err != nil {
 		return err
 	}
 	DisableFooter = true
@@ -173,12 +186,99 @@ func targetFromArgs(args []string) (string, string) {
 	return target, arch
 }
 
-func Package(_ *flags.Package, otherArgs []string) error {
+func Package(options *flags.Package, otherArgs []string) error {
+	if options.JSON && !options.Plan {
+		return fmt.Errorf("--json requires --plan")
+	}
+	if packagePipelineRequested(options) {
+		buildFlags := packageBuildFlags(options)
+		if options.Plan {
+			return printTypedPipelinePlan(buildFlags, nil, "package", otherArgs, "")
+		}
+		return executeTypedPipeline(buildFlags, nil, "package", otherArgs, "")
+	}
 	return wrapTask("package", otherArgs)
 }
 
-func SignWrapper(_ *flags.SignWrapper, otherArgs []string) error {
+func SignWrapper(options *flags.SignWrapper, otherArgs []string) error {
+	if options.JSON && !options.Plan {
+		return fmt.Errorf("--json requires --plan")
+	}
+	if signingPipelineRequested(options) {
+		buildFlags := signBuildFlags(options)
+		signOptions := pipelineSignOptions(options)
+		goal := "sign"
+		if options.Notarize {
+			goal = "notarize"
+		}
+		if options.Plan {
+			return printTypedPipelinePlan(buildFlags, signOptions, goal, otherArgs, "")
+		}
+		return executeTypedPipeline(buildFlags, signOptions, goal, otherArgs, "")
+	}
 	return wrapTask("sign", otherArgs)
+}
+
+func packagePipelineRequested(options *flags.Package) bool {
+	return options.Plan || options.Pipeline || options.Parallel ||
+		options.NoCache || options.Resume || options.CacheDir != "" || options.Report != "" ||
+		len(options.Targets) > 0 || len(options.Formats) > 0
+}
+
+func signingPipelineRequested(options *flags.SignWrapper) bool {
+	return options.Plan || options.Pipeline || options.Parallel || options.Notarize ||
+		options.NoCache || options.Resume || options.CacheDir != "" || options.Report != "" ||
+		len(options.Targets) > 0 || len(options.Formats) > 0 ||
+		options.Certificate != "" || options.Thumbprint != "" || options.Timestamp != "" ||
+		options.Identity != "" || options.Entitlements != "" || options.HardenedRuntime ||
+		options.KeychainProfile != "" || options.PGPKey != "" || options.Role != ""
+}
+
+func packageBuildFlags(options *flags.Package) *flags.Build {
+	return &flags.Build{
+		Config:   options.Config,
+		Targets:  options.Targets,
+		Packages: options.Formats,
+		JSON:     options.JSON,
+		Plan:     options.Plan,
+		Pipeline: options.Pipeline,
+		Parallel: options.Parallel,
+		NoCache:  options.NoCache,
+		Resume:   options.Resume,
+		CacheDir: options.CacheDir,
+		Report:   options.Report,
+	}
+}
+
+func signBuildFlags(options *flags.SignWrapper) *flags.Build {
+	return &flags.Build{
+		Config:   options.Config,
+		Targets:  options.Targets,
+		Packages: options.Formats,
+		JSON:     options.JSON,
+		Plan:     options.Plan,
+		Pipeline: options.Pipeline,
+		Parallel: options.Parallel,
+		NoCache:  options.NoCache,
+		Resume:   options.Resume,
+		CacheDir: options.CacheDir,
+		Report:   options.Report,
+	}
+}
+
+func pipelineSignOptions(options *flags.SignWrapper) *flags.Sign {
+	return &flags.Sign{
+		Certificate:     options.Certificate,
+		Thumbprint:      options.Thumbprint,
+		Timestamp:       options.Timestamp,
+		Identity:        options.Identity,
+		Entitlements:    options.Entitlements,
+		HardenedRuntime: options.HardenedRuntime,
+		Notarize:        options.Notarize,
+		KeychainProfile: options.KeychainProfile,
+		PGPKey:          options.PGPKey,
+		Role:            options.Role,
+	}
 }
 
 func wrapTask(action string, otherArgs []string) error {
