@@ -53,6 +53,13 @@ func TestStageInspectionRenderers(t *testing.T) {
 			"GOOS":   "linux",
 		},
 	}}
+	inspection.Stage.Settings = map[string]any{"trimPath": false}
+	inspection.Stage.Before = []Hook{{
+		Name: "prepare", Command: []string{"echo", "prepare"}, Shell: true,
+		ResolvedCommand: []string{"/bin/sh", "-c", "echo prepare"}, Scope: "target",
+		Status: "planned", OnFailure: "continue", Inputs: map[string]string{"source": "go.mod"},
+		Outputs: map[string]string{"prepared": "build/prepared"}, Cache: HookCacheInputs{Files: []string{"go.mod"}},
+	}}
 	assert.Equal(t, "native.compile", inspection.Stage.ID)
 	assert.Equal(t, plan.Targets, inspection.Targets)
 
@@ -70,6 +77,12 @@ func TestStageInspectionRenderers(t *testing.T) {
 	assert.Contains(t, textOutput.String(), "Public stage:   native.compile")
 	assert.Contains(t, textOutput.String(), "Implementation: wails/native.compile")
 	assert.Contains(t, textOutput.String(), "Needs:          frontend.build, platform.generate[linux/amd64]")
+	assert.Contains(t, textOutput.String(), `Settings:      {"trimPath":false}`)
+	assert.Contains(t, textOutput.String(), "Cache:          true")
+	assert.Contains(t, textOutput.String(), "Cache excludes: .git, .wails, .beads, node_modules")
+	assert.Contains(t, textOutput.String(), `execution: "/bin/sh" "-c" "echo prepare"`)
+	assert.Contains(t, textOutput.String(), "source=go.mod")
+	assert.Contains(t, textOutput.String(), "cache files: go.mod")
 	assert.Contains(t, textOutput.String(), "Execution:")
 	assert.Contains(t, textOutput.String(), `"go" "build" "-ldflags=-w -s"`)
 	assert.Contains(t, textOutput.String(), "GOARCH=amd64")

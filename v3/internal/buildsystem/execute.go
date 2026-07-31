@@ -22,6 +22,10 @@ type ExecuteOptions struct {
 	Until           string
 	Step            string
 	Parallel        bool
+	DisableCache    bool
+	Resume          bool
+	CacheDirectory  string
+	ReportPath      string
 	Stdout          io.Writer
 	Stderr          io.Writer
 	Builtins        map[string]StageFunc
@@ -29,14 +33,27 @@ type ExecuteOptions struct {
 	OnStage         func(Stage, string)
 	OnAction        func(Stage, Action, string)
 	callbackMu      *sync.Mutex
+	hookRuns        *hookRunState
+	runtime         *executionRuntime
 }
 
 type StageContext struct {
-	Plan      *Plan
-	Stage     Stage
-	Artifacts map[string]Artifact
-	Stdout    io.Writer
-	Stderr    io.Writer
+	Plan       *Plan
+	Stage      Stage
+	Artifacts  map[string]Artifact
+	Stdout     io.Writer
+	Stderr     io.Writer
+	HookInputs map[string]string
+}
+
+type hookRunState struct {
+	mu      sync.Mutex
+	entries map[string]*hookRun
+}
+
+type hookRun struct {
+	done chan struct{}
+	err  error
 }
 
 type synchronizedWriter struct {
@@ -50,7 +67,7 @@ func (writer *synchronizedWriter) Write(data []byte) (int, error) {
 	return writer.writer.Write(data)
 }
 
-func Execute(ctx context.Context, plan *Plan, options ExecuteOptions) error {
+func Execute(ctx context.Context, plan *Plan, options ExecuteOptions) (resultErr error) {
 	if plan == nil {
 		return errors.New("build plan is nil")
 	}
@@ -66,6 +83,9 @@ func Execute(ctx context.Context, plan *Plan, options ExecuteOptions) error {
 	if options.callbackMu == nil {
 		options.callbackMu = &sync.Mutex{}
 	}
+	if options.hookRuns == nil {
+		options.hookRuns = &hookRunState{entries: make(map[string]*hookRun)}
+	}
 	if options.Parallel {
 		options.Stdout = &synchronizedWriter{writer: options.Stdout}
 		options.Stderr = &synchronizedWriter{writer: options.Stderr}
@@ -73,6 +93,18 @@ func Execute(ctx context.Context, plan *Plan, options ExecuteOptions) error {
 	order, selected, err := executionOrder(plan.Stages, options)
 	if err != nil {
 		return err
+	}
+	runtime, err := newExecutionRuntime(plan, options, selected)
+	if err != nil {
+		return err
+	}
+	options.runtime = runtime
+	if runtime.report != nil {
+		defer func() {
+			if reportErr := runtime.report.finish(resultErr); reportErr != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("write execution report: %w", reportErr))
+			}
+		}()
 	}
 	artifacts := collectArtifacts(prerequisiteStages(plan.Stages, selected))
 	if options.Parallel {
@@ -105,13 +137,53 @@ func executeStage(
 	stage Stage,
 	options ExecuteOptions,
 	artifacts map[string]Artifact,
-) ([]Artifact, error) {
+) (outputs []Artifact, resultErr error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	cacheDecision := "disabled"
+	fingerprint := ""
+	if stage.Cache.Enabled && options.runtime != nil && options.runtime.cache != nil {
+		var err error
+		fingerprint, err = options.runtime.cache.fingerprint(plan, stage, artifacts)
+		if err != nil {
+			return nil, fmt.Errorf("fingerprint stage %s: %w", stage.Reference(), err)
+		}
+		if options.runtime.cacheEnabled {
+			cacheDecision = "miss"
+		}
+	}
+	if options.runtime != nil && options.runtime.report != nil {
+		options.runtime.report.stageStarted(stage, fingerprint, cacheDecision)
+		defer func() {
+			status := "completed"
+			if resultErr != nil {
+				status = "failed"
+			}
+			options.runtime.report.stageFinished(stage, status, cacheDecision, resultErr)
+		}()
+	}
 	if stage.Status == "skipped" {
+		cacheDecision = "not-applicable"
 		notifyStage(options, stage, "skipped")
 		return nil, nil
+	}
+	if fingerprint != "" && options.runtime.canResume(stage, fingerprint) {
+		cacheDecision = "resumed"
+		notifyStage(options, stage, "resumed")
+		return stage.Outputs, nil
+	}
+	if fingerprint != "" && options.runtime.cacheEnabled {
+		restored, err := options.runtime.cache.restore(stage, fingerprint)
+		if err != nil {
+			fmt.Fprintf(options.Stderr, "cache restore for %s failed; executing stage: %v\n", stage.Reference(), err)
+		} else if restored {
+			if err := verifyOutputs(plan.Project.Root, stage); err == nil {
+				cacheDecision = "hit"
+				notifyStage(options, stage, "cached")
+				return stage.Outputs, nil
+			}
+		}
 	}
 
 	stageContext := &StageContext{
@@ -125,7 +197,7 @@ func executeStage(
 		return nil, err
 	}
 	notifyStage(options, stage, "running")
-	if err := executeHooks(ctx, stageContext, stage.Before); err != nil {
+	if err := executeHooks(ctx, stageContext, stage.Before, "before", options); err != nil {
 		return nil, fmt.Errorf("stage %s before hook: %w", stage.Reference(), err)
 	}
 	if stage.Replacement != nil {
@@ -153,13 +225,21 @@ func executeStage(
 		}
 	}
 	registerArtifacts(stageContext.Artifacts, stage.Outputs)
-	if err := executeHooks(ctx, stageContext, stage.After); err != nil {
+	if err := executeHooks(ctx, stageContext, stage.After, "after", options); err != nil {
 		return nil, fmt.Errorf("stage %s after hook: %w", stage.Reference(), err)
 	}
 	if err := verifyOutputs(plan.Project.Root, stage); err != nil {
 		return nil, err
 	}
 	notifyStage(options, stage, "completed")
+	if fingerprint != "" && options.runtime.cacheEnabled {
+		if err := options.runtime.cache.store(stage, fingerprint); err != nil {
+			cacheDecision = "store-failed"
+			fmt.Fprintf(options.Stderr, "cache store for %s failed: %v\n", stage.Reference(), err)
+		} else {
+			cacheDecision = "stored"
+		}
+	}
 	return stage.Outputs, nil
 }
 
@@ -171,9 +251,18 @@ func executeActions(ctx context.Context, stageContext *StageContext, options Exe
 			continue
 		}
 		notifyAction(options, stageContext.Stage, action, "running")
+		if options.runtime != nil && options.runtime.report != nil {
+			options.runtime.report.actionStarted(stageContext.Stage, index)
+		}
 		if err := executeAction(ctx, stageContext, action, options.InternalActions); err != nil {
+			if options.runtime != nil && options.runtime.report != nil {
+				options.runtime.report.actionFinished(stageContext.Stage, index, "failed", err)
+			}
 			cleanupErr := executeFinalActions(ctx, stageContext, options, actions[index+1:])
 			return errors.Join(err, cleanupErr)
+		}
+		if options.runtime != nil && options.runtime.report != nil {
+			options.runtime.report.actionFinished(stageContext.Stage, index, "completed", nil)
 		}
 		notifyAction(options, stageContext.Stage, action, "completed")
 	}
@@ -188,14 +277,24 @@ func executeFinalActions(
 ) error {
 	ctx = context.WithoutCancel(ctx)
 	var result error
-	for _, action := range actions {
+	for offset, action := range actions {
 		if !action.Finally || action.Status == "skipped" {
 			continue
 		}
 		notifyAction(options, stageContext.Stage, action, "running")
+		index := len(stageContext.Stage.Actions) - len(actions) + offset
+		if options.runtime != nil && options.runtime.report != nil {
+			options.runtime.report.actionStarted(stageContext.Stage, index)
+		}
 		if err := executeAction(ctx, stageContext, action, options.InternalActions); err != nil {
+			if options.runtime != nil && options.runtime.report != nil {
+				options.runtime.report.actionFinished(stageContext.Stage, index, "failed", err)
+			}
 			result = errors.Join(result, err)
 			continue
+		}
+		if options.runtime != nil && options.runtime.report != nil {
+			options.runtime.report.actionFinished(stageContext.Stage, index, "completed", nil)
 		}
 		notifyAction(options, stageContext.Stage, action, "completed")
 	}
@@ -224,10 +323,13 @@ func executeAction(
 		}
 		return nil
 	case ActionCopy:
-		return copyFile(
-			expand(action.Source, stageContext),
-			expand(action.Destination, stageContext),
-		)
+		source := expand(action.Source, stageContext)
+		if action.Optional {
+			if _, err := os.Stat(source); os.IsNotExist(err) {
+				return nil
+			}
+		}
+		return copyFile(source, expand(action.Destination, stageContext))
 	case ActionInternal:
 		implementation := internalActions[action.Internal]
 		if implementation == nil {
@@ -238,6 +340,9 @@ func executeAction(
 		return os.MkdirAll(expand(action.Path, stageContext), 0o755)
 	case ActionRemove:
 		path := expand(action.Path, stageContext)
+		if action.Recursive {
+			return os.RemoveAll(path)
+		}
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return err
 		}
@@ -259,6 +364,10 @@ func copyFile(source, destination string) error {
 		return err
 	}
 	defer input.Close()
+	info, err := input.Stat()
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
 		return err
 	}
@@ -267,6 +376,10 @@ func copyFile(source, destination string) error {
 		return err
 	}
 	if _, err := io.Copy(output, input); err != nil {
+		output.Close()
+		return err
+	}
+	if err := output.Chmod(info.Mode().Perm()); err != nil {
 		output.Close()
 		return err
 	}
@@ -454,6 +567,9 @@ func verifyInputs(root string, stage Stage) error {
 
 func verifyOutputs(root string, stage Stage) error {
 	for _, output := range stage.Outputs {
+		if output.Optional {
+			continue
+		}
 		if output.Path == "" {
 			continue
 		}
@@ -464,24 +580,133 @@ func verifyOutputs(root string, stage Stage) error {
 	return nil
 }
 
-func executeHooks(ctx context.Context, stageContext *StageContext, hooks []Hook) error {
+func executeHooks(ctx context.Context, stageContext *StageContext, hooks []Hook, position string, options ExecuteOptions) error {
 	for _, hook := range hooks {
-		if err := executeCommand(
-			ctx,
-			stageContext,
-			hook.Command,
-			hook.WorkingDirectory,
-			hook.Environment,
-			hook.Timeout,
-		); err != nil {
+		if hook.Status == "skipped" {
+			continue
+		}
+		err := options.hookRuns.execute(ctx, hookScopeKey(stageContext.Stage, hook, position), func() error {
+			return executeHook(ctx, stageContext, hook)
+		})
+		if err != nil {
 			name := hook.Name
 			if name == "" {
 				name = strings.Join(hook.Command, " ")
+			}
+			if hook.OnFailure == "continue" {
+				fmt.Fprintf(stageContext.Stderr, "hook %s failed and was allowed to continue: %v\n", name, err)
+				continue
 			}
 			return fmt.Errorf("%s: %w", name, err)
 		}
 	}
 	return nil
+}
+
+func (state *hookRunState) execute(ctx context.Context, key string, run func() error) error {
+	state.mu.Lock()
+	if existing := state.entries[key]; existing != nil {
+		state.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-existing.done:
+			return existing.err
+		}
+	}
+	entry := &hookRun{done: make(chan struct{})}
+	state.entries[key] = entry
+	state.mu.Unlock()
+
+	entry.err = run()
+	close(entry.done)
+	return entry.err
+}
+
+func hookScopeKey(stage Stage, hook Hook, position string) string {
+	identity := hook.ID
+	if identity == "" {
+		identity = stage.ID + "." + position + "." + hook.Name + "." + strings.Join(hook.Command, "\x00")
+	}
+	key := identity + "/" + hook.Scope
+	platform, arch, format := "all", "all", "all"
+	if stage.Target != nil {
+		platform, arch = stage.Target.Platform, stage.Target.Arch
+	}
+	for _, artifact := range append(stage.Inputs, stage.Outputs...) {
+		if artifact.Target != nil && artifact.Target.Format != "" {
+			format = artifact.Target.Format
+			break
+		}
+	}
+	switch hook.Scope {
+	case "build":
+		return key
+	case "target":
+		return key + "/" + platform + "/" + arch
+	case "architecture":
+		return key + "/" + arch
+	case "package":
+		return key + "/" + format
+	default:
+		return key + "/" + stage.Reference()
+	}
+}
+
+func executeHook(ctx context.Context, stageContext *StageContext, hook Hook) error {
+	environment := make(map[string]string, len(hook.Environment)+len(hook.Inputs))
+	for name, value := range hook.Environment {
+		environment[name] = value
+	}
+	stageContext.HookInputs = make(map[string]string, len(hook.Inputs))
+	defer func() { stageContext.HookInputs = nil }()
+	for name, value := range hook.Inputs {
+		path := expand(value, stageContext)
+		if !filepath.IsAbs(path) {
+			path = resolvePath(stageContext.Plan.Project.Root, path)
+		}
+		if _, err := os.Stat(path); err != nil {
+			return fmt.Errorf("input %q at %s: %w", name, path, err)
+		}
+		stageContext.HookInputs[name] = path
+		environment["WAILS_HOOK_INPUT_"+environmentName(name)] = path
+	}
+	command := hook.Command
+	if hook.Shell {
+		command = hook.ResolvedCommand
+		if len(command) == 0 {
+			command = shellCommand(hook.Command)
+		}
+	}
+	if err := executeCommand(ctx, stageContext, command, hook.WorkingDirectory, environment, hook.Timeout); err != nil {
+		return err
+	}
+	for name, value := range hook.Outputs {
+		path := expand(value, stageContext)
+		if !filepath.IsAbs(path) {
+			path = resolvePath(stageContext.Plan.Project.Root, path)
+		}
+		if _, err := os.Stat(path); err != nil {
+			return fmt.Errorf("declared output %q at %s: %w", name, path, err)
+		}
+		for _, output := range stageContext.Stage.Outputs {
+			if output.Name == name && resolvePath(stageContext.Plan.Project.Root, output.Path) == path {
+				registerArtifacts(stageContext.Artifacts, []Artifact{output})
+				break
+			}
+		}
+	}
+	return nil
+}
+
+func environmentName(value string) string {
+	value = strings.ToUpper(value)
+	return strings.Map(func(character rune) rune {
+		if character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' {
+			return character
+		}
+		return '_'
+	}, value)
 }
 
 func appendCommand(command *Command) []string {
@@ -549,13 +774,15 @@ func writeContext(stageContext *StageContext) (string, error) {
 	}
 	path := filepath.Join(directory, SafeInstanceName(stageContext.Stage.Reference())+".json")
 	payload := struct {
-		Stage     Stage               `json:"stage"`
-		Targets   []Target            `json:"targets"`
-		Artifacts map[string]Artifact `json:"artifacts"`
+		Stage      Stage               `json:"stage"`
+		Targets    []Target            `json:"targets"`
+		Artifacts  map[string]Artifact `json:"artifacts"`
+		HookInputs map[string]string   `json:"hookInputs,omitempty"`
 	}{
-		Stage:     stageContext.Stage,
-		Targets:   stageContext.Plan.Targets,
-		Artifacts: stageContext.Artifacts,
+		Stage:      stageContext.Stage,
+		Targets:    stageContext.Plan.Targets,
+		Artifacts:  stageContext.Artifacts,
+		HookInputs: stageContext.HookInputs,
 	}
 	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {

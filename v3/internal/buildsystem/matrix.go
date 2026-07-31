@@ -60,7 +60,7 @@ func excludeTargets(targets []Target, exclusions []TargetSelector) []Target {
 	return result
 }
 
-func defaultStages(plan *Plan, frontendOutput string) []Stage {
+func defaultStages(plan *Plan, frontendOutput string, packageFormats []string) []Stage {
 	sharedArtifact := func(name, kind, path, producer string) Artifact {
 		return Artifact{
 			ID:       name,
@@ -160,7 +160,6 @@ func defaultStages(plan *Plan, frontendOutput string) []Stage {
 		stages = append(stages, stage)
 	}
 
-	binaries := make([]Artifact, 0, len(plan.Targets))
 	nativeStages := make(map[string]Stage, len(plan.Targets))
 	for _, target := range plan.Targets {
 		key := targetKey(target)
@@ -180,68 +179,123 @@ func defaultStages(plan *Plan, frontendOutput string) []Stage {
 			[]Artifact{binary},
 		)
 		nativeStages[key] = stage
-		binaries = append(binaries, binary)
 		stages = append(stages, stage)
 	}
 
-	platformCounts := make(map[string]int)
-	for _, target := range plan.Targets {
-		platformCounts[target.Platform]++
+	finalArtifacts := make([]Artifact, 0, len(plan.Targets)+1)
+	finalNeeds := make([]string, 0, len(plan.Targets)+1)
+	darwinTargets := targetsForPlatform(plan.Targets, "darwin")
+	var universalCombine *Stage
+	if len(darwinTargets) > 1 {
+		target := Target{Platform: "darwin", Arch: "universal"}
+		for _, sourceTarget := range darwinTargets {
+			target.Tags = mergeTags(target.Tags, sourceTarget.Tags)
+		}
+		producer := stageInstance("binary.combine", &target)
+		inputs := make([]Artifact, 0, len(darwinTargets))
+		needs := make([]string, 0, len(darwinTargets))
+		for _, sourceTarget := range darwinTargets {
+			native := nativeStages[targetKey(sourceTarget)]
+			inputs = append(inputs, native.Outputs[0])
+			needs = append(needs, native.Reference())
+		}
+		output := targetArtifact(
+			"binary",
+			"universal-binary",
+			binaryPath(plan, target),
+			producer,
+			target,
+		)
+		combine := planned("binary.combine", &target, needs, inputs, []Artifact{output})
+		universalCombine = &combine
+		stages = append(stages, combine)
 	}
+
 	for _, target := range plan.Targets {
 		key := targetKey(target)
-		combineReason := "single-architecture build"
-		if target.Platform == "darwin" && platformCounts[target.Platform] > 1 {
-			combineReason = "multi-architecture combination is not yet implemented"
+		native := nativeStages[key]
+		if target.Platform != "darwin" {
+			combine := skipped(
+				"binary.combine",
+				&target,
+				[]string{native.Reference()},
+				"target does not require architecture combination",
+			)
+			bundle := skipped(
+				"bundle.assemble",
+				&target,
+				[]string{native.Reference(), combine.Reference()},
+				"target uses the native binary as its runnable artifact",
+			)
+			stages = append(stages, combine, bundle)
+			distribution, artifacts, needs := distributionStages(
+				plan, target, native.Outputs[0], native.Reference(), packageFormats, planned, skipped,
+			)
+			stages = append(stages, distribution...)
+			finalArtifacts = append(finalArtifacts, artifacts...)
+			finalNeeds = append(finalNeeds, needs...)
+			continue
+		}
+
+		if universalCombine != nil {
+			continue
 		}
 		combine := skipped(
 			"binary.combine",
 			&target,
-			[]string{nativeStages[key].Reference()},
-			combineReason,
+			[]string{native.Reference()},
+			"single-architecture build",
 		)
-		bundle := skipped(
-			"bundle.assemble",
-			&target,
-			[]string{nativeStages[key].Reference(), combine.Reference()},
-			"not selected by the build goal",
+		bundle := darwinBundleStage(
+			plan,
+			target,
+			native.Outputs[0],
+			platforms[key].Outputs[0],
+			[]string{native.Reference(), combine.Reference(), platforms[key].Reference()},
+			planned,
 		)
-		bundleSign := skipped(
-			"bundle.sign",
-			&target,
-			[]string{bundle.Reference()},
-			"not selected by the build goal",
+		stages = append(stages, combine, bundle)
+		distribution, artifacts, needs := distributionStages(
+			plan, target, bundle.Outputs[0], bundle.Reference(), packageFormats, planned, skipped,
 		)
-		packageCreate := skipped(
-			"package.create",
-			&target,
-			[]string{bundleSign.Reference()},
-			"not selected by the build goal",
-		)
-		packageSign := skipped(
-			"package.sign",
-			&target,
-			[]string{packageCreate.Reference()},
-			"not selected by the build goal",
-		)
-		packageNotarize := skipped(
-			"package.notarize",
-			&target,
-			[]string{packageSign.Reference()},
-			"not selected by the build goal",
-		)
-		stages = append(stages, combine, bundle, bundleSign, packageCreate, packageSign, packageNotarize)
+		stages = append(stages, distribution...)
+		if plan.Goal == "build" {
+			finalArtifacts = append(finalArtifacts, native.Outputs[0])
+			finalNeeds = append(finalNeeds, native.Reference())
+		}
+		finalArtifacts = append(finalArtifacts, artifacts...)
+		finalNeeds = append(finalNeeds, needs...)
 	}
 
-	nativeNeeds := make([]string, 0, len(nativeStages))
-	for _, target := range plan.Targets {
-		nativeNeeds = append(nativeNeeds, nativeStages[targetKey(target)].Reference())
+	if universalCombine != nil {
+		target := *universalCombine.Target
+		platform := platforms[targetKey(darwinTargets[0])]
+		bundle := darwinBundleStage(
+			plan,
+			target,
+			universalCombine.Outputs[0],
+			platform.Outputs[0],
+			[]string{universalCombine.Reference(), platform.Reference()},
+			planned,
+		)
+		stages = append(stages, bundle)
+		distribution, artifacts, needs := distributionStages(
+			plan, target, bundle.Outputs[0], bundle.Reference(), packageFormats, planned, skipped,
+		)
+		stages = append(stages, distribution...)
+		if plan.Goal == "build" {
+			finalArtifacts = append(finalArtifacts, universalCombine.Outputs[0])
+			finalNeeds = append(finalNeeds, universalCombine.Reference())
+		}
+		finalArtifacts = append(finalArtifacts, artifacts...)
+		finalNeeds = append(finalNeeds, needs...)
 	}
+
 	stages = append(stages, planned(
 		"artifacts.collect",
 		nil,
-		nativeNeeds,
-		binaries,
+		finalNeeds,
+		finalArtifacts,
 		[]Artifact{sharedArtifact(
 			"manifest",
 			"artifact-manifest",
@@ -250,6 +304,185 @@ func defaultStages(plan *Plan, frontendOutput string) []Stage {
 		)},
 	))
 	return stages
+}
+
+func targetsForPlatform(targets []Target, platform string) []Target {
+	result := make([]Target, 0, len(targets))
+	for _, target := range targets {
+		if target.Platform == platform {
+			result = append(result, target)
+		}
+	}
+	return result
+}
+
+func darwinBundleStage(
+	plan *Plan,
+	target Target,
+	binary Artifact,
+	platform Artifact,
+	needs []string,
+	planned func(string, *Target, []string, []Artifact, []Artifact) Stage,
+) Stage {
+	producer := stageInstance("bundle.assemble", &target)
+	bundle := Artifact{
+		Name:     "bundle",
+		Type:     "application-bundle",
+		Path:     filepath.ToSlash(bundlePath(plan, target)),
+		Producer: producer,
+		Target:   artifactTarget(&target),
+	}
+	bundle.ID = artifactIdentity(bundle)
+	return planned("bundle.assemble", &target, needs, []Artifact{binary, platform}, []Artifact{bundle})
+}
+
+func distributionStages(
+	plan *Plan,
+	target Target,
+	runnable Artifact,
+	runnableProducer string,
+	requestedFormats []string,
+	planned func(string, *Target, []string, []Artifact, []Artifact) Stage,
+	skipped func(string, *Target, []string, string) Stage,
+) ([]Stage, []Artifact, []string) {
+	signing := plan.Goal == "sign" || plan.Goal == "notarize"
+	bundleSign := skipped("bundle.sign", &target, []string{runnableProducer}, "signing was not requested")
+	if signing && (target.Platform == "darwin" || target.Platform == "windows") {
+		bundleSign = planned("bundle.sign", &target, []string{runnableProducer}, []Artifact{runnable}, nil)
+	} else if signing {
+		bundleSign.Reason = "target does not sign its runnable artifact before packaging"
+	}
+	stages := []Stage{bundleSign}
+
+	formats := packageFormats(target.Platform, requestedFormats)
+	finalArtifacts := make([]Artifact, 0, len(formats))
+	finalNeeds := make([]string, 0, len(formats))
+	for _, format := range formats {
+		instance := formatStageInstance("package.create", target, format)
+		output := packageArtifact(plan, target, format, instance)
+		needs := []string{runnableProducer, bundleSign.Reference()}
+		create := skipped("package.create", &target, needs, "not selected by the build goal")
+		create.Instance = instance
+		if plan.Goal != "build" {
+			create = planned("package.create", &target, needs, []Artifact{runnable}, []Artifact{output})
+			create.Instance = instance
+			create.Outputs[0].Producer = instance
+		}
+		stages = append(stages, create)
+
+		signInstance := formatStageInstance("package.sign", target, format)
+		packageSign := skipped("package.sign", &target, []string{create.Reference()}, "signing was not requested")
+		packageSign.Instance = signInstance
+		if signing && signablePackageFormat(target.Platform, format) {
+			packageSign = planned("package.sign", &target, []string{create.Reference()}, []Artifact{output}, nil)
+			packageSign.Instance = signInstance
+		} else if signing {
+			packageSign.Reason = "package format does not use a separate signing step"
+		}
+		stages = append(stages, packageSign)
+
+		notarizeInstance := formatStageInstance("package.notarize", target, format)
+		notarize := skipped(
+			"package.notarize",
+			&target,
+			[]string{create.Reference(), packageSign.Reference(), bundleSign.Reference()},
+			"notarization was not requested",
+		)
+		notarize.Instance = notarizeInstance
+		if plan.Goal == "notarize" && target.Platform == "darwin" {
+			notarize = planned(
+				"package.notarize",
+				&target,
+				[]string{create.Reference(), packageSign.Reference(), bundleSign.Reference()},
+				[]Artifact{runnable, output},
+				nil,
+			)
+			notarize.Instance = notarizeInstance
+		}
+		stages = append(stages, notarize)
+
+		if plan.Goal == "build" {
+			continue
+		}
+		finalArtifacts = append(finalArtifacts, output)
+		finalNeeds = append(finalNeeds, create.Reference())
+		if packageSign.Status == "planned" {
+			finalNeeds = append(finalNeeds, packageSign.Reference())
+		}
+		if notarize.Status == "planned" {
+			finalNeeds = append(finalNeeds, notarize.Reference())
+		}
+	}
+
+	if plan.Goal == "build" {
+		return stages, []Artifact{runnable}, []string{runnableProducer}
+	}
+	return stages, finalArtifacts, finalNeeds
+}
+
+func packageFormats(platform string, requested []string) []string {
+	if len(requested) > 0 {
+		return append([]string(nil), requested...)
+	}
+	switch platform {
+	case "windows":
+		return []string{"nsis"}
+	case "darwin":
+		return []string{"zip"}
+	case "linux":
+		return []string{"deb", "rpm", "archlinux"}
+	default:
+		return nil
+	}
+}
+
+func formatStageInstance(id string, target Target, format string) string {
+	return id + "[" + targetKey(target) + "/" + format + "]"
+}
+
+func packageArtifact(plan *Plan, target Target, format, producer string) Artifact {
+	artifact := Artifact{
+		Name:     "package",
+		Type:     "distribution-package",
+		Path:     filepath.ToSlash(packagePath(plan, target, format)),
+		Producer: producer,
+		Target: &ArtifactTarget{
+			Platform: target.Platform,
+			Arch:     target.Arch,
+			Format:   format,
+		},
+	}
+	artifact.ID = artifactIdentity(artifact)
+	return artifact
+}
+
+func packagePath(plan *Plan, target Target, format string) string {
+	directory := plan.Project.Output
+	if len(plan.Targets) > 1 {
+		directory = filepath.Join(directory, target.Platform, target.Arch)
+	}
+	name := plan.Project.BinaryName
+	switch format {
+	case "nsis":
+		return filepath.Join(directory, name+"-"+strings.ToUpper(target.Arch)+"-installer.exe")
+	case "archlinux":
+		return filepath.Join(directory, name+".pkg.tar.zst")
+	default:
+		return filepath.Join(directory, name+"."+format)
+	}
+}
+
+func signablePackageFormat(platform, format string) bool {
+	return (platform == "windows" && format == "nsis") ||
+		(platform == "linux" && (format == "deb" || format == "rpm"))
+}
+
+func bundlePath(plan *Plan, target Target) string {
+	name := plan.Project.BinaryName + ".app"
+	if len(plan.Targets) == 1 {
+		return filepath.Join(plan.Project.Output, name)
+	}
+	return filepath.Join(plan.Project.Output, target.Platform, target.Arch, name)
 }
 
 func binaryPath(plan *Plan, target Target) string {

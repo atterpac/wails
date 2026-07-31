@@ -100,6 +100,28 @@ func WriteStageText(writer io.Writer, inspection *StageInspection) error {
 			return err
 		}
 	}
+	if len(stage.Settings) > 0 {
+		settings, err := json.Marshal(stage.Settings)
+		if err != nil {
+			return fmt.Errorf("encode stage settings: %w", err)
+		}
+		if _, err := fmt.Fprintf(writer, "Settings:      %s\n", settings); err != nil {
+			return err
+		}
+	}
+	if _, err := fmt.Fprintf(writer, "Cache:          %t\n", stage.Cache.Enabled); err != nil {
+		return err
+	}
+	if stage.Cache.Enabled && len(stage.Cache.Sources) > 0 {
+		if _, err := fmt.Fprintf(writer, "Cache sources:  %s\n", strings.Join(stage.Cache.Sources, ", ")); err != nil {
+			return err
+		}
+	}
+	if stage.Cache.Enabled && len(stage.Cache.Exclusions) > 0 {
+		if _, err := fmt.Fprintf(writer, "Cache excludes: %s\n", strings.Join(stage.Cache.Exclusions, ", ")); err != nil {
+			return err
+		}
+	}
 
 	if len(stage.Before) > 0 {
 		if _, err := fmt.Fprintln(writer, "\nBefore hooks:"); err != nil {
@@ -176,6 +198,16 @@ func writeActions(writer io.Writer, actions []Action) error {
 		}
 		if action.Finally {
 			if _, err := fmt.Fprint(writer, " [finally]"); err != nil {
+				return err
+			}
+		}
+		if action.Optional {
+			if _, err := fmt.Fprint(writer, " [optional]"); err != nil {
+				return err
+			}
+		}
+		if action.Recursive {
+			if _, err := fmt.Fprint(writer, " [recursive]"); err != nil {
 				return err
 			}
 		}
@@ -268,11 +300,28 @@ func writeHooks(writer io.Writer, hooks []Hook) error {
 		if name == "" {
 			name = strings.Join(hook.Command, " ")
 		}
-		if _, err := fmt.Fprintf(writer, "  %s\n", name); err != nil {
+		status := hook.Status
+		if status == "" {
+			status = "planned"
+		}
+		if _, err := fmt.Fprintf(writer, "  %s [%s]\n", name, status); err != nil {
 			return err
 		}
-		if _, err := fmt.Fprintf(writer, "    command: %s\n", strings.Join(hook.Command, " ")); err != nil {
+		if hook.Reason != "" {
+			if _, err := fmt.Fprintf(writer, "    reason: %s\n", hook.Reason); err != nil {
+				return err
+			}
+		}
+		if _, err := fmt.Fprintf(writer, "    command: %s\n", formatCommand(hook.Command)); err != nil {
 			return err
+		}
+		if hook.Shell {
+			if _, err := fmt.Fprintln(writer, "    shell: true"); err != nil {
+				return err
+			}
+			if _, err := fmt.Fprintf(writer, "    execution: %s\n", formatCommand(hook.ResolvedCommand)); err != nil {
+				return err
+			}
 		}
 		if _, err := fmt.Fprintf(writer, "    scope: %s\n", hook.Scope); err != nil {
 			return err
@@ -286,6 +335,47 @@ func writeHooks(writer io.Writer, hooks []Hook) error {
 			if _, err := fmt.Fprintf(writer, "    timeout: %s\n", hook.Timeout); err != nil {
 				return err
 			}
+		}
+		if _, err := fmt.Fprintf(writer, "    on failure: %s\n", hook.OnFailure); err != nil {
+			return err
+		}
+		for _, field := range []struct {
+			name   string
+			values map[string]string
+		}{{"inputs", hook.Inputs}, {"outputs", hook.Outputs}, {"environment", hook.Environment}, {"cache values", hook.Cache.Values}} {
+			if len(field.values) == 0 {
+				continue
+			}
+			if _, err := fmt.Fprintf(writer, "    %s:\n", field.name); err != nil {
+				return err
+			}
+			if err := writeStringMap(writer, "      ", field.values); err != nil {
+				return err
+			}
+		}
+		if len(hook.Cache.Files) > 0 {
+			if _, err := fmt.Fprintf(writer, "    cache files: %s\n", strings.Join(hook.Cache.Files, ", ")); err != nil {
+				return err
+			}
+		}
+		if len(hook.Cache.Environment) > 0 {
+			if _, err := fmt.Fprintf(writer, "    cache environment: %s\n", strings.Join(hook.Cache.Environment, ", ")); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func writeStringMap(writer io.Writer, indentation string, values map[string]string) error {
+	names := make([]string, 0, len(values))
+	for name := range values {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if _, err := fmt.Fprintf(writer, "%s%s=%s\n", indentation, name, values[name]); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -335,6 +425,9 @@ func WriteText(writer io.Writer, plan *Plan) error {
 	if _, err := fmt.Fprintf(writer, "Project:    %s\n", plan.Project.Name); err != nil {
 		return err
 	}
+	if _, err := fmt.Fprintf(writer, "Goal:       %s\n", plan.Goal); err != nil {
+		return err
+	}
 	if _, err := fmt.Fprintf(writer, "Binary:     %s\n", plan.Project.BinaryName); err != nil {
 		return err
 	}
@@ -346,6 +439,9 @@ func WriteText(writer io.Writer, plan *Plan) error {
 	}
 	for _, stage := range plan.Stages {
 		line := fmt.Sprintf("  %-38s %-7s", stage.Reference(), stage.Status)
+		if stage.Cache.Enabled {
+			line += "  cacheable"
+		}
 		if stage.Reason != "" {
 			line += "  " + stage.Reason
 		} else if stage.Replacement != nil {

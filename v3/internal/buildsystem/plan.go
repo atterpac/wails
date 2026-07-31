@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -27,16 +29,19 @@ type Request struct {
 	Mode        string
 	Tags        []string
 	Obfuscated  bool
+	Goal        string
+	Packages    []string
 }
 
 type Plan struct {
-	Version     string   `json:"version"`
-	Project     Project  `json:"project"`
-	Targets     []Target `json:"targets"`
-	Mode        string   `json:"mode"`
-	Goal        string   `json:"goal"`
-	Stages      []Stage  `json:"stages"`
-	Diagnostics []string `json:"diagnostics,omitempty"`
+	Version     string        `json:"version"`
+	Project     Project       `json:"project"`
+	Targets     []Target      `json:"targets"`
+	Mode        string        `json:"mode"`
+	Goal        string        `json:"goal"`
+	Signing     SigningConfig `json:"signing,omitempty"`
+	Stages      []Stage       `json:"stages"`
+	Diagnostics []string      `json:"diagnostics,omitempty"`
 }
 
 type Project struct {
@@ -56,19 +61,27 @@ type Target struct {
 }
 
 type Stage struct {
-	ID             string     `json:"id"`
-	Instance       string     `json:"instance"`
-	Target         *Target    `json:"target,omitempty"`
-	Implementation string     `json:"implementation"`
-	Needs          []string   `json:"needs,omitempty"`
-	Status         string     `json:"status"`
-	Reason         string     `json:"reason,omitempty"`
-	Inputs         []Artifact `json:"inputs,omitempty"`
-	Outputs        []Artifact `json:"outputs,omitempty"`
-	Actions        []Action   `json:"actions,omitempty"`
-	Before         []Hook     `json:"before,omitempty"`
-	After          []Hook     `json:"after,omitempty"`
-	Replacement    *Command   `json:"replacement,omitempty"`
+	ID             string         `json:"id"`
+	Instance       string         `json:"instance"`
+	Target         *Target        `json:"target,omitempty"`
+	Implementation string         `json:"implementation"`
+	Needs          []string       `json:"needs,omitempty"`
+	Status         string         `json:"status"`
+	Reason         string         `json:"reason,omitempty"`
+	Inputs         []Artifact     `json:"inputs,omitempty"`
+	Outputs        []Artifact     `json:"outputs,omitempty"`
+	Actions        []Action       `json:"actions,omitempty"`
+	Before         []Hook         `json:"before,omitempty"`
+	After          []Hook         `json:"after,omitempty"`
+	Replacement    *Command       `json:"replacement,omitempty"`
+	Settings       map[string]any `json:"settings,omitempty"`
+	Cache          CachePolicy    `json:"cache"`
+}
+
+type CachePolicy struct {
+	Enabled    bool     `json:"enabled"`
+	Sources    []string `json:"sources,omitempty"`
+	Exclusions []string `json:"exclusions,omitempty"`
 }
 
 type Artifact struct {
@@ -78,6 +91,7 @@ type Artifact struct {
 	Path     string          `json:"path,omitempty"`
 	Producer string          `json:"producer,omitempty"`
 	Target   *ArtifactTarget `json:"target,omitempty"`
+	Optional bool            `json:"optional,omitempty"`
 }
 
 // ArtifactTarget identifies the target-specific variant of an artifact.
@@ -108,6 +122,8 @@ type Action struct {
 	Status           string            `json:"status,omitempty"`
 	Reason           string            `json:"reason,omitempty"`
 	Finally          bool              `json:"finally,omitempty"`
+	Optional         bool              `json:"optional,omitempty"`
+	Recursive        bool              `json:"recursive,omitempty"`
 	Command          []string          `json:"command,omitempty"`
 	WorkingDirectory string            `json:"workingDirectory,omitempty"`
 	Environment      map[string]string `json:"environment,omitempty"`
@@ -121,13 +137,56 @@ type Action struct {
 }
 
 type Hook struct {
+	ID               string            `yaml:"-"                          json:"id,omitempty"`
 	Name             string            `yaml:"name"                       json:"name,omitempty"`
 	Command          []string          `yaml:"command"                    json:"command"`
+	Shell            bool              `yaml:"shell,omitempty"            json:"shell,omitempty"`
+	ResolvedCommand  []string          `yaml:"-"                          json:"resolvedCommand,omitempty"`
 	WorkingDirectory string            `yaml:"workingDirectory,omitempty" json:"workingDirectory,omitempty"`
 	Scope            string            `yaml:"scope,omitempty"            json:"scope,omitempty"`
 	Environment      map[string]string `yaml:"env,omitempty"              json:"environment,omitempty"`
+	Inputs           map[string]string `yaml:"inputs,omitempty"           json:"inputs,omitempty"`
+	Outputs          map[string]string `yaml:"outputs,omitempty"          json:"outputs,omitempty"`
 	Sources          []string          `yaml:"sources,omitempty"          json:"sources,omitempty"`
+	Cache            HookCacheInputs   `yaml:"cache,omitempty"            json:"cache,omitempty"`
+	When             HookCondition     `yaml:"when,omitempty"             json:"when,omitempty"`
+	OnFailure        string            `yaml:"onFailure,omitempty"        json:"onFailure,omitempty"`
 	Timeout          string            `yaml:"timeout,omitempty"          json:"timeout,omitempty"`
+	Status           string            `yaml:"-"                          json:"status"`
+	Reason           string            `yaml:"-"                          json:"reason,omitempty"`
+}
+
+type HookCacheInputs struct {
+	Files       []string          `yaml:"files,omitempty"       json:"files,omitempty"`
+	Environment []string          `yaml:"environment,omitempty" json:"environment,omitempty"`
+	Values      map[string]string `yaml:"values,omitempty"      json:"values,omitempty"`
+}
+
+type HookCondition struct {
+	Platform    StringList        `yaml:"platform,omitempty"    json:"platform,omitempty"`
+	Arch        StringList        `yaml:"arch,omitempty"        json:"arch,omitempty"`
+	Mode        StringList        `yaml:"mode,omitempty"        json:"mode,omitempty"`
+	Format      StringList        `yaml:"format,omitempty"      json:"format,omitempty"`
+	Environment map[string]string `yaml:"env,omitempty"         json:"environment,omitempty"`
+}
+
+type StringList []string
+
+func (values *StringList) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		var value string
+		if err := node.Decode(&value); err != nil {
+			return err
+		}
+		*values = []string{value}
+		return nil
+	}
+	var result []string
+	if err := node.Decode(&result); err != nil {
+		return err
+	}
+	*values = result
+	return nil
 }
 
 type Command struct {
@@ -139,10 +198,11 @@ type Command struct {
 }
 
 type stageConfig struct {
-	Before  []Hook   `yaml:"before"`
-	After   []Hook   `yaml:"after"`
-	Replace *Command `yaml:"replace"`
-	Matrix  struct {
+	Before   []Hook         `yaml:"before"`
+	After    []Hook         `yaml:"after"`
+	Replace  *Command       `yaml:"replace"`
+	Settings map[string]any `yaml:"settings"`
+	Matrix   struct {
 		Exclude []TargetSelector `yaml:"exclude"`
 	} `yaml:"matrix"`
 }
@@ -152,15 +212,38 @@ type TargetSelector struct {
 	Arch     string `yaml:"arch"     json:"arch,omitempty"`
 }
 
+type PackageConfig struct {
+	Format string `yaml:"format" json:"format"`
+}
+
+type SigningConfig struct {
+	Darwin struct {
+		Identity        string `yaml:"identity" json:"identity,omitempty"`
+		Entitlements    string `yaml:"entitlements" json:"entitlements,omitempty"`
+		KeychainProfile string `yaml:"keychainProfile" json:"keychainProfile,omitempty"`
+	} `yaml:"darwin" json:"darwin,omitempty"`
+	Windows struct {
+		Certificate     string `yaml:"certificate" json:"certificate,omitempty"`
+		Thumbprint      string `yaml:"thumbprint" json:"thumbprint,omitempty"`
+		TimestampServer string `yaml:"timestampServer" json:"timestampServer,omitempty"`
+	} `yaml:"windows" json:"windows,omitempty"`
+	Linux struct {
+		PGPKey string `yaml:"pgpKey" json:"pgpKey,omitempty"`
+		Role   string `yaml:"role" json:"role,omitempty"`
+	} `yaml:"linux" json:"linux,omitempty"`
+}
+
 type projectConfig struct {
 	Info struct {
 		ProductName string `yaml:"productName"`
 	} `yaml:"info"`
 	Build struct {
-		BinaryName string   `yaml:"binaryName"`
-		Output     string   `yaml:"output"`
-		Tags       []string `yaml:"tags"`
-		Targets    []Target `yaml:"targets"`
+		BinaryName string          `yaml:"binaryName"`
+		Output     string          `yaml:"output"`
+		Tags       []string        `yaml:"tags"`
+		Targets    []Target        `yaml:"targets"`
+		Packages   []PackageConfig `yaml:"packages"`
+		Signing    SigningConfig   `yaml:"signing"`
 		Frontend   struct {
 			Directory      string `yaml:"directory"`
 			PackageManager string `yaml:"packageManager"`
@@ -245,6 +328,26 @@ func Resolve(request Request) (*Plan, error) {
 		return nil, fmt.Errorf("build target matrix is empty after exclusions")
 	}
 
+	goal := request.Goal
+	if goal == "" {
+		goal = "build"
+	}
+	switch goal {
+	case "build", "package", "sign", "notarize":
+	default:
+		return nil, fmt.Errorf("unsupported build goal %q", goal)
+	}
+	packages := request.Packages
+	if len(packages) == 0 {
+		for _, configured := range cfg.Build.Packages {
+			packages = append(packages, configured.Format)
+		}
+	}
+	packages, err = normalisePackageFormats(packages)
+	if err != nil {
+		return nil, err
+	}
+
 	plan := &Plan{
 		Version: PlanVersion,
 		Project: Project{
@@ -257,10 +360,12 @@ func Resolve(request Request) (*Plan, error) {
 		},
 		Targets: targets,
 		Mode:    mode,
-		Goal:    "build",
+		Goal:    goal,
+		Signing: cfg.Build.Signing,
 	}
-	plan.Stages = defaultStages(plan, frontendOutput)
-	if err := applyStageConfig(plan.Stages, cfg.Build.Stages); err != nil {
+	plan.Stages = defaultStages(plan, frontendOutput, packages)
+	normaliseCachePolicies(plan)
+	if err := applyStageConfig(plan, cfg.Build.Stages); err != nil {
 		return nil, err
 	}
 	normaliseArtifacts(plan)
@@ -276,7 +381,48 @@ func Resolve(request Request) (*Plan, error) {
 	return plan, nil
 }
 
-func applyStageConfig(stages []Stage, configured map[string]stageConfig) error {
+func normaliseCachePolicies(plan *Plan) {
+	for index := range plan.Stages {
+		stage := &plan.Stages[index]
+		stage.Cache = CachePolicy{
+			Enabled:    cacheableStage(*stage),
+			Sources:    []string{"${project.root}"},
+			Exclusions: []string{".git", ".wails", ".beads", "node_modules", plan.Project.Output},
+		}
+	}
+}
+
+func cacheableStage(stage Stage) bool {
+	if len(stage.Outputs) == 0 {
+		return false
+	}
+	switch stage.ID {
+	case "bundle.sign", "package.sign", "package.notarize":
+		return false
+	default:
+		return true
+	}
+}
+
+func normalisePackageFormats(formats []string) ([]string, error) {
+	result := make([]string, 0, len(formats))
+	seen := make(map[string]bool, len(formats))
+	for _, format := range formats {
+		format = strings.ToLower(strings.TrimSpace(format))
+		if format == "" {
+			return nil, fmt.Errorf("package format must not be empty")
+		}
+		if seen[format] {
+			return nil, fmt.Errorf("duplicate package format %q", format)
+		}
+		seen[format] = true
+		result = append(result, format)
+	}
+	return result, nil
+}
+
+func applyStageConfig(plan *Plan, configured map[string]stageConfig) error {
+	stages := plan.Stages
 	for id, config := range configured {
 		var indexes []int
 		for index := range stages {
@@ -287,16 +433,35 @@ func applyStageConfig(stages []Stage, configured map[string]stageConfig) error {
 		if len(indexes) == 0 {
 			return fmt.Errorf("build configuration references unknown stage %q", id)
 		}
+		if err := validateStageSettings(id, config.Settings); err != nil {
+			return err
+		}
 		for _, hook := range append(slices.Clone(config.Before), config.After...) {
 			if len(hook.Command) == 0 {
 				return fmt.Errorf("stage %q contains a hook without a command", id)
 			}
 		}
-		normaliseHooks(config.Before)
-		normaliseHooks(config.After)
+		if err := normaliseHooks(id, "before", config.Before); err != nil {
+			return err
+		}
+		if err := normaliseHooks(id, "after", config.After); err != nil {
+			return err
+		}
 		for _, index := range indexes {
-			stages[index].Before = slices.Clone(config.Before)
-			stages[index].After = slices.Clone(config.After)
+			stages[index].Settings = cloneSettings(config.Settings)
+			if id == "frontend.build" {
+				if output, ok := config.Settings["output"].(string); ok {
+					for outputIndex := range stages[index].Outputs {
+						if stages[index].Outputs[outputIndex].Name == "frontend" {
+							stages[index].Outputs[outputIndex].Path = filepath.ToSlash(output)
+						}
+					}
+				}
+			}
+			stages[index].Before = resolveHooks(plan, stages[index], config.Before)
+			stages[index].After = resolveHooks(plan, stages[index], config.After)
+			appendHookOutputs(&stages[index], stages[index].Before)
+			appendHookOutputs(&stages[index], stages[index].After)
 			if config.Replace == nil {
 				continue
 			}
@@ -331,7 +496,26 @@ func applyStageConfig(stages []Stage, configured map[string]stageConfig) error {
 			}
 		}
 	}
+	plan.Stages = stages
+	synchroniseArtifactPaths(plan)
 	return nil
+}
+
+func synchroniseArtifactPaths(plan *Plan) {
+	outputs := make(map[string]Artifact)
+	for _, stage := range plan.Stages {
+		for _, output := range stage.Outputs {
+			outputs[output.Producer+"\x00"+output.Name] = output
+		}
+	}
+	for stageIndex := range plan.Stages {
+		for inputIndex := range plan.Stages[stageIndex].Inputs {
+			input := &plan.Stages[stageIndex].Inputs[inputIndex]
+			if output, ok := outputs[input.Producer+"\x00"+input.Name]; ok {
+				input.Path = output.Path
+			}
+		}
+	}
 }
 
 func expandTargetPath(path string, target *Target) string {
@@ -342,14 +526,203 @@ func expandTargetPath(path string, target *Target) string {
 	return strings.ReplaceAll(path, "${target.arch}", target.Arch)
 }
 
-func normaliseHooks(hooks []Hook) {
+func normaliseHooks(stageID, position string, hooks []Hook) error {
 	for index := range hooks {
+		hooks[index].ID = fmt.Sprintf("%s.%s.%d", stageID, position, index)
 		if hooks[index].Scope == "" {
 			hooks[index].Scope = "stage"
+		}
+		switch hooks[index].Scope {
+		case "stage", "build", "target", "architecture", "package":
+		default:
+			return fmt.Errorf("stage %q hook %q has unsupported scope %q", stageID, hooks[index].Name, hooks[index].Scope)
+		}
+		if hooks[index].OnFailure == "" {
+			hooks[index].OnFailure = "fail"
+		}
+		if hooks[index].OnFailure != "fail" && hooks[index].OnFailure != "continue" {
+			return fmt.Errorf("stage %q hook %q has unsupported failure behavior %q", stageID, hooks[index].Name, hooks[index].OnFailure)
+		}
+		if hooks[index].Timeout != "" {
+			if _, err := time.ParseDuration(hooks[index].Timeout); err != nil {
+				return fmt.Errorf("stage %q hook %q has invalid timeout %q: %w", stageID, hooks[index].Name, hooks[index].Timeout, err)
+			}
 		}
 		if hooks[index].WorkingDirectory == "" {
 			hooks[index].WorkingDirectory = "${project.root}"
 		}
+		hooks[index].Cache.Files = mergeUnique(hooks[index].Cache.Files, hooks[index].Sources)
+		hooks[index].Sources = nil
+		hooks[index].Status = "planned"
+		if hooks[index].Shell {
+			hooks[index].ResolvedCommand = shellCommand(hooks[index].Command)
+		}
+	}
+	return nil
+}
+
+func shellCommand(command []string) []string {
+	if runtime.GOOS == "windows" {
+		return []string{"cmd.exe", "/S", "/C", strings.Join(command, " ")}
+	}
+	return []string{"/bin/sh", "-c", strings.Join(command, " ")}
+}
+
+func mergeUnique(groups ...[]string) []string {
+	var result []string
+	for _, group := range groups {
+		for _, value := range group {
+			if value != "" && !slices.Contains(result, value) {
+				result = append(result, value)
+			}
+		}
+	}
+	return result
+}
+
+func validateStageSettings(stageID string, settings map[string]any) error {
+	if len(settings) == 0 {
+		return nil
+	}
+	allowed := map[string]map[string]string{
+		"dependencies.prepare": {"goModules": "string", "frontend": "string"},
+		"frontend.build":       {"directory": "string", "install": "command", "build": "command", "output": "string", "environment": "map"},
+		"platform.generate":    {"overlays": "map"},
+		"native.compile":       {"tags": "strings", "trimPath": "bool", "vcsInfo": "bool"},
+	}[stageID]
+	if allowed == nil {
+		return fmt.Errorf("stage %q does not support declarative settings", stageID)
+	}
+	for name, value := range settings {
+		kind, ok := allowed[name]
+		if !ok {
+			return fmt.Errorf("stage %q has unknown setting %q", stageID, name)
+		}
+		valid := false
+		switch kind {
+		case "string":
+			_, valid = value.(string)
+		case "bool":
+			_, valid = value.(bool)
+		case "map":
+			_, valid = value.(map[string]any)
+		case "strings":
+			valid = stringSequence(value)
+		case "command":
+			group, isMap := value.(map[string]any)
+			valid = isMap && stringSequence(group["command"])
+		}
+		if !valid {
+			return fmt.Errorf("stage %q setting %q must be %s", stageID, name, kind)
+		}
+	}
+	if value, ok := settings["goModules"].(string); ok && !slices.Contains([]string{"none", "validate", "download", "tidy"}, value) {
+		return fmt.Errorf("stage %q setting %q has unsupported value %q", stageID, "goModules", value)
+	}
+	if value, ok := settings["frontend"].(string); ok && !slices.Contains([]string{"none", "install", "install-if-needed"}, value) {
+		return fmt.Errorf("stage %q setting %q has unsupported value %q", stageID, "frontend", value)
+	}
+	return nil
+}
+
+func stringSequence(value any) bool {
+	switch values := value.(type) {
+	case []string:
+		return true
+	case []any:
+		for _, value := range values {
+			if _, ok := value.(string); !ok {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func resolveHooks(plan *Plan, stage Stage, hooks []Hook) []Hook {
+	result := slices.Clone(hooks)
+	for index := range result {
+		if reason := hookConditionMismatch(plan, stage, result[index].When); reason != "" {
+			result[index].Status = "skipped"
+			result[index].Reason = reason
+		}
+	}
+	return result
+}
+
+func hookConditionMismatch(plan *Plan, stage Stage, condition HookCondition) string {
+	platform, arch, format := "", "", ""
+	if stage.Target != nil {
+		platform, arch = stage.Target.Platform, stage.Target.Arch
+	}
+	for _, artifact := range append(slices.Clone(stage.Inputs), stage.Outputs...) {
+		if artifact.Target != nil && artifact.Target.Format != "" {
+			format = artifact.Target.Format
+			break
+		}
+	}
+	checks := []struct {
+		name   string
+		actual string
+		values StringList
+	}{
+		{"platform", platform, condition.Platform},
+		{"architecture", arch, condition.Arch},
+		{"mode", plan.Mode, condition.Mode},
+		{"package format", format, condition.Format},
+	}
+	for _, check := range checks {
+		if len(check.values) > 0 && !slices.Contains(check.values, check.actual) {
+			return fmt.Sprintf("%s %q does not match %s", check.name, check.actual, strings.Join(check.values, ", "))
+		}
+	}
+	for name, expected := range condition.Environment {
+		if actual := os.Getenv(name); actual != expected {
+			return fmt.Sprintf("environment %s does not match configured value", name)
+		}
+	}
+	return ""
+}
+
+func appendHookOutputs(stage *Stage, hooks []Hook) {
+	for _, hook := range hooks {
+		if hook.Status == "skipped" {
+			continue
+		}
+		for name, path := range hook.Outputs {
+			stage.Outputs = append(stage.Outputs, Artifact{
+				Name: name, Type: "custom", Path: filepath.ToSlash(expandTargetPath(path, stage.Target)),
+				Target: artifactTarget(stage.Target), Optional: hook.OnFailure == "continue",
+			})
+		}
+	}
+}
+
+func cloneSettings(settings map[string]any) map[string]any {
+	if settings == nil {
+		return nil
+	}
+	result := make(map[string]any, len(settings))
+	for name, value := range settings {
+		result[name] = cloneSettingValue(value)
+	}
+	return result
+}
+
+func cloneSettingValue(value any) any {
+	switch value := value.(type) {
+	case map[string]any:
+		return cloneSettings(value)
+	case []any:
+		result := make([]any, len(value))
+		for index := range value {
+			result[index] = cloneSettingValue(value[index])
+		}
+		return result
+	default:
+		return value
 	}
 }
 

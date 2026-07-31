@@ -1,6 +1,7 @@
 package buildsystem
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -97,6 +98,59 @@ func TestExecuteRunsReplacementAndExpandsArtifactPath(t *testing.T) {
 
 	require.NoError(t, Execute(context.Background(), plan, ExecuteOptions{}))
 	assert.FileExists(t, filepath.Join(root, "dist", "custom"))
+}
+
+func TestExecuteRunsBuildScopedHookOnceAcrossParallelStages(t *testing.T) {
+	root := t.TempDir()
+	marker := filepath.Join(root, "hook-runs")
+	hook := Hook{
+		ID: "native.compile.before.0", Name: "prepare", Scope: "build", Status: "planned",
+		Command: []string{os.Args[0], "-test.run=TestBuildsystemHelperProcess", "--"},
+		Environment: map[string]string{
+			"GO_WANT_BUILDSYSTEM_HELPER": "1", "TARGET_FILE": marker, "HELPER_APPEND": "1",
+		},
+	}
+	plan := &Plan{Project: Project{Root: root}, Stages: []Stage{
+		{ID: "native.compile", Instance: "native.compile[linux/amd64]", Status: "planned", Before: []Hook{hook}},
+		{ID: "native.compile", Instance: "native.compile[linux/arm64]", Status: "planned", Before: []Hook{hook}},
+	}}
+	require.NoError(t, Execute(context.Background(), plan, ExecuteOptions{
+		Parallel: true,
+		Builtins: map[string]StageFunc{"native.compile": func(context.Context, *StageContext) error { return nil }},
+	}))
+	data, err := os.ReadFile(marker)
+	require.NoError(t, err)
+	assert.Equal(t, "run\n", string(data))
+}
+
+func TestExecuteHookValidatesInputsPublishesOutputsAndContinuesFailures(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, "source"), []byte("input"), 0o644))
+	var stderr bytes.Buffer
+	plan := &Plan{Project: Project{Root: root}, Stages: []Stage{{
+		ID: "custom", Status: "planned",
+		Before: []Hook{{
+			ID: "custom.before.0", Name: "generate", Scope: "stage", Status: "planned",
+			Command: []string{os.Args[0], "-test.run=TestBuildsystemHelperProcess", "--"},
+			Environment: map[string]string{
+				"GO_WANT_BUILDSYSTEM_HELPER": "1", "TARGET_FILE": "${project.root}/generated", "HELPER_COPY_INPUT": "1",
+			},
+			Inputs:  map[string]string{"source": "${project.root}/source"},
+			Outputs: map[string]string{"generated": "generated"},
+		}, {
+			ID: "custom.before.1", Name: "nonfatal", Scope: "stage", Status: "planned", OnFailure: "continue",
+			Command:     []string{os.Args[0], "-test.run=TestBuildsystemHelperProcess", "--"},
+			Environment: map[string]string{"GO_WANT_BUILDSYSTEM_HELPER": "1", "HELPER_FAIL": "1"},
+		}},
+	}}}
+	require.NoError(t, Execute(context.Background(), plan, ExecuteOptions{
+		Stderr:   &stderr,
+		Builtins: map[string]StageFunc{"custom": func(context.Context, *StageContext) error { return nil }},
+	}))
+	data, err := os.ReadFile(filepath.Join(root, "generated"))
+	require.NoError(t, err)
+	assert.Equal(t, "input", string(data))
+	assert.Contains(t, stderr.String(), "allowed to continue")
 }
 
 func TestExecuteRunsResolvedActions(t *testing.T) {
@@ -453,8 +507,27 @@ func TestBuildsystemHelperProcess(t *testing.T) {
 		os.Exit(4)
 	}
 	path := os.Getenv("TARGET_FILE")
+	if os.Getenv("HELPER_COPY_INPUT") == "1" {
+		data, err := os.ReadFile(os.Getenv("WAILS_HOOK_INPUT_SOURCE"))
+		if err != nil || os.WriteFile(path, data, 0o644) != nil {
+			os.Exit(3)
+		}
+		os.Exit(0)
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		os.Exit(2)
+	}
+	if os.Getenv("HELPER_APPEND") == "1" {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			os.Exit(3)
+		}
+		_, err = file.WriteString("run\n")
+		_ = file.Close()
+		if err != nil {
+			os.Exit(3)
+		}
+		os.Exit(0)
 	}
 	if err := os.WriteFile(path, []byte("generated"), 0o644); err != nil {
 		os.Exit(3)
