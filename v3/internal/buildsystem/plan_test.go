@@ -56,15 +56,17 @@ build:
 	assert.Equal(t, "dist", plan.Project.Output)
 	assert.Equal(t, "web", plan.Project.Frontend)
 	assert.Equal(t, "pnpm", plan.Project.PackageManager)
-	assert.Equal(t, "windows", plan.Target.Platform)
-	assert.Equal(t, "arm64", plan.Target.Arch)
-	assert.Equal(t, []string{"enterprise", "custom", "production", "wails_obfuscated"}, plan.Target.Tags)
+	require.Len(t, plan.Targets, 1)
+	assert.Equal(t, "windows", plan.Targets[0].Platform)
+	assert.Equal(t, "arm64", plan.Targets[0].Arch)
+	assert.Equal(t, []string{"enterprise", "custom", "production", "wails_obfuscated"}, plan.Targets[0].Tags)
 	assert.Empty(t, plan.Diagnostics)
 
 	native := findStage(t, plan, "native.compile")
+	assert.Equal(t, "native.compile[windows/arm64]", native.Instance)
 	assert.Equal(t, "planned", native.Status)
 	assert.Equal(t, "dist/plan-test.exe", native.Outputs[0].Path)
-	assert.ElementsMatch(t, []string{"frontend.build", "platform.generate"}, native.Needs)
+	assert.ElementsMatch(t, []string{"frontend.build", "platform.generate[windows/arm64]"}, native.Needs)
 	require.Len(t, native.Before, 1)
 	assert.Equal(t, []string{"go", "generate", "./..."}, native.Before[0].Command)
 	require.Len(t, native.After, 1)
@@ -93,8 +95,142 @@ func TestResolveUsesDefaultsWithoutConfig(t *testing.T) {
 	assert.Equal(t, "bin", plan.Project.Output)
 	assert.Equal(t, "frontend", plan.Project.Frontend)
 	assert.Equal(t, "npm", plan.Project.PackageManager)
-	assert.Equal(t, []string{"production"}, plan.Target.Tags)
+	assert.Equal(t, []string{"production"}, plan.Targets[0].Tags)
 	require.Len(t, plan.Diagnostics, 1)
+}
+
+func TestResolveExpandsTargetMatrix(t *testing.T) {
+	root := t.TempDir()
+	plan, err := Resolve(Request{
+		ProjectRoot: root,
+		Targets: []Target{
+			{Platform: "windows", Arch: "amd64"},
+			{Platform: "linux", Arch: "arm64", Tags: []string{"linux-custom"}},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, plan.Targets, 2)
+	assert.Equal(t, []string{"production"}, plan.Targets[0].Tags)
+	assert.Equal(t, []string{"production", "linux-custom"}, plan.Targets[1].Tags)
+
+	native := findStages(plan, "native.compile")
+	require.Len(t, native, 2)
+	assert.Equal(t, "native.compile[windows/amd64]", native[0].Reference())
+	assert.Equal(t, "bin/windows/amd64/"+filepath.Base(root)+".exe", native[0].Outputs[0].Path)
+	assert.Equal(t, "binary[windows/amd64]", native[0].Outputs[0].Reference())
+	assert.Equal(t, "native.compile[linux/arm64]", native[1].Reference())
+	assert.Equal(t, "bin/linux/arm64/"+filepath.Base(root), native[1].Outputs[0].Path)
+	assert.Equal(t, "binary[linux/arm64]", native[1].Outputs[0].Reference())
+
+	collect := findStage(t, plan, "artifacts.collect")
+	assert.Equal(t, []string{
+		"native.compile[windows/amd64]",
+		"native.compile[linux/arm64]",
+	}, collect.Needs)
+	require.Len(t, collect.Inputs, 2)
+	assert.Equal(t, "binary[windows/amd64]", collect.Inputs[0].Reference())
+	assert.Equal(t, "binary[linux/arm64]", collect.Inputs[1].Reference())
+
+	_, err = InspectStage(plan, "native.compile")
+	require.EqualError(
+		t,
+		err,
+		`build stage "native.compile" is ambiguous; select one of native.compile[windows/amd64], native.compile[linux/arm64]`,
+	)
+	inspection, err := InspectStage(plan, "native.compile[linux/arm64]")
+	require.NoError(t, err)
+	assert.Equal(t, "linux", inspection.Stage.Target.Platform)
+}
+
+func TestResolveRejectsDuplicateTargets(t *testing.T) {
+	_, err := Resolve(Request{
+		ProjectRoot: t.TempDir(),
+		Targets: []Target{
+			{Platform: "linux", Arch: "amd64"},
+			{Platform: "linux", Arch: "amd64"},
+		},
+	})
+	require.EqualError(t, err, `duplicate build target "linux/amd64"`)
+}
+
+func TestResolveLoadsTargetMatrixFromConfig(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "build"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "build", "config.yml"), []byte(`
+build:
+  targets:
+    - platform: darwin
+      arch: amd64
+    - platform: darwin
+      arch: arm64
+      tags: [apple-silicon]
+`), 0o644))
+
+	plan, err := Resolve(Request{ProjectRoot: root})
+	require.NoError(t, err)
+	require.Len(t, plan.Targets, 2)
+	assert.Equal(t, "darwin", plan.Targets[0].Platform)
+	assert.Equal(t, "amd64", plan.Targets[0].Arch)
+	assert.Equal(t, []string{"production"}, plan.Targets[0].Tags)
+	assert.Equal(t, []string{"production", "apple-silicon"}, plan.Targets[1].Tags)
+	require.Len(t, findStages(plan, "native.compile"), 2)
+}
+
+func TestResolveAppliesNativeCompileMatrixExclusions(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "build"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "build", "config.yml"), []byte(`
+build:
+  targets:
+    - platform: darwin
+      arch: amd64
+    - platform: darwin
+      arch: arm64
+    - platform: windows
+      arch: amd64
+  stages:
+    native.compile:
+      matrix:
+        exclude:
+          - platform: darwin
+            arch: amd64
+          - platform: windows
+`), 0o644))
+
+	plan, err := Resolve(Request{ProjectRoot: root})
+	require.NoError(t, err)
+	assert.Equal(t, []Target{{
+		Platform: "darwin",
+		Arch:     "arm64",
+		Tags:     []string{"production"},
+	}}, plan.Targets)
+	require.Len(t, findStages(plan, "native.compile"), 1)
+}
+
+func TestResolveExpandsTargetPathsForMatrixReplacements(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "build"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "build", "config.yml"), []byte(`
+build:
+  targets:
+    - platform: windows
+      arch: amd64
+    - platform: linux
+      arch: arm64
+  stages:
+    native.compile:
+      replace:
+        command: [./compile, "${target.platform}", "${target.arch}"]
+        produces:
+          binary: dist/${target.platform}/${target.arch}/application
+`), 0o644))
+
+	plan, err := Resolve(Request{ProjectRoot: root})
+	require.NoError(t, err)
+	native := findStages(plan, "native.compile")
+	require.Len(t, native, 2)
+	assert.Equal(t, "dist/windows/amd64/application", native[0].Outputs[0].Path)
+	assert.Equal(t, "dist/linux/arm64/application", native[1].Outputs[0].Path)
 }
 
 func TestResolveRejectsUnsupportedTarget(t *testing.T) {
@@ -158,4 +294,14 @@ func findStage(t *testing.T, plan *Plan, id string) Stage {
 	}
 	t.Fatalf("stage %q not found", id)
 	return Stage{}
+}
+
+func findStages(plan *Plan, id string) []Stage {
+	var result []Stage
+	for _, stage := range plan.Stages {
+		if stage.ID == id {
+			result = append(result, stage)
+		}
+	}
+	return result
 }

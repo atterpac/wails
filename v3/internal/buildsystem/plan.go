@@ -8,18 +8,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
+// PlanVersion remains at 1 while the unreleased plan contract is evolving.
+// Increment it only when compatibility with a released schema is required.
 const PlanVersion = "1"
 
 type Request struct {
 	ProjectRoot string
 	ConfigPath  string
+	Targets     []Target
 	Target      string
 	Arch        string
 	Mode        string
@@ -30,7 +32,7 @@ type Request struct {
 type Plan struct {
 	Version     string   `json:"version"`
 	Project     Project  `json:"project"`
-	Target      Target   `json:"target"`
+	Targets     []Target `json:"targets"`
 	Mode        string   `json:"mode"`
 	Goal        string   `json:"goal"`
 	Stages      []Stage  `json:"stages"`
@@ -48,9 +50,9 @@ type Project struct {
 }
 
 type Target struct {
-	Platform string   `json:"platform"`
-	Arch     string   `json:"arch"`
-	Tags     []string `json:"tags"`
+	Platform string   `yaml:"platform" json:"platform"`
+	Arch     string   `yaml:"arch"     json:"arch"`
+	Tags     []string `yaml:"tags"     json:"tags"`
 }
 
 type Stage struct {
@@ -140,6 +142,14 @@ type stageConfig struct {
 	Before  []Hook   `yaml:"before"`
 	After   []Hook   `yaml:"after"`
 	Replace *Command `yaml:"replace"`
+	Matrix  struct {
+		Exclude []TargetSelector `yaml:"exclude"`
+	} `yaml:"matrix"`
+}
+
+type TargetSelector struct {
+	Platform string `yaml:"platform" json:"platform,omitempty"`
+	Arch     string `yaml:"arch"     json:"arch,omitempty"`
 }
 
 type projectConfig struct {
@@ -150,6 +160,7 @@ type projectConfig struct {
 		BinaryName string   `yaml:"binaryName"`
 		Output     string   `yaml:"output"`
 		Tags       []string `yaml:"tags"`
+		Targets    []Target `yaml:"targets"`
 		Frontend   struct {
 			Directory      string `yaml:"directory"`
 			PackageManager string `yaml:"packageManager"`
@@ -173,21 +184,6 @@ func Resolve(request Request) (*Plan, error) {
 		return nil, fmt.Errorf("resolve project root: %w", err)
 	}
 
-	target := request.Target
-	if target == "" {
-		target = runtime.GOOS
-	}
-	arch := request.Arch
-	if arch == "" {
-		arch = runtime.GOARCH
-	}
-	if !supportedTarget(target) {
-		return nil, fmt.Errorf("unsupported build target %q", target)
-	}
-	if arch == "" {
-		return nil, fmt.Errorf("build architecture must not be empty")
-	}
-
 	configPath := request.ConfigPath
 	if configPath == "" {
 		configPath = filepath.Join("build", "config.yml")
@@ -209,7 +205,6 @@ func Resolve(request Request) (*Plan, error) {
 	if binaryName == "" {
 		binaryName = normaliseName(filepath.Base(root))
 	}
-	binaryFilename := binaryName
 	output := cfg.Build.Output
 	if output == "" {
 		output = "bin"
@@ -238,18 +233,16 @@ func Resolve(request Request) (*Plan, error) {
 	if request.Obfuscated {
 		tags = mergeTags(tags, []string{"wails_obfuscated"})
 	}
-
-	if target == "windows" && !strings.EqualFold(filepath.Ext(binaryFilename), ".exe") {
-		binaryFilename += ".exe"
+	if len(request.Targets) == 0 && request.Target == "" && request.Arch == "" && len(cfg.Build.Targets) > 0 {
+		request.Targets = cfg.Build.Targets
 	}
-	paths := artifactPaths{
-		bindings:       filepath.Join(frontend, "bindings"),
-		frontend:       frontendOutput,
-		assets:         filepath.Join(".wails", "build", target, arch, "assets"),
-		platform:       filepath.Join(".wails", "build", target, arch, "platform"),
-		binary:         filepath.Join(output, binaryFilename),
-		bundle:         bundlePath(output, name, target),
-		artifactReport: filepath.Join(output, "artifacts.json"),
+	targets, err := resolveTargets(request, tags)
+	if err != nil {
+		return nil, err
+	}
+	targets = excludeTargets(targets, cfg.Build.Stages["native.compile"].Matrix.Exclude)
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("build target matrix is empty after exclusions")
 	}
 
 	plan := &Plan{
@@ -262,12 +255,16 @@ func Resolve(request Request) (*Plan, error) {
 			Frontend:       frontend,
 			PackageManager: packageManager,
 		},
-		Target: Target{Platform: target, Arch: arch, Tags: tags},
-		Mode:   mode,
-		Goal:   "build",
-		Stages: defaultStages(paths),
+		Targets: targets,
+		Mode:    mode,
+		Goal:    "build",
 	}
+	plan.Stages = defaultStages(plan, frontendOutput)
 	if err := applyStageConfig(plan.Stages, cfg.Build.Stages); err != nil {
+		return nil, err
+	}
+	normaliseArtifacts(plan)
+	if err := Validate(plan); err != nil {
 		return nil, err
 	}
 	if configFound {
@@ -281,10 +278,13 @@ func Resolve(request Request) (*Plan, error) {
 
 func applyStageConfig(stages []Stage, configured map[string]stageConfig) error {
 	for id, config := range configured {
-		index := slices.IndexFunc(stages, func(stage Stage) bool {
-			return stage.ID == id
-		})
-		if index < 0 {
+		var indexes []int
+		for index := range stages {
+			if stages[index].ID == id {
+				indexes = append(indexes, index)
+			}
+		}
+		if len(indexes) == 0 {
 			return fmt.Errorf("build configuration references unknown stage %q", id)
 		}
 		for _, hook := range append(slices.Clone(config.Before), config.After...) {
@@ -294,40 +294,52 @@ func applyStageConfig(stages []Stage, configured map[string]stageConfig) error {
 		}
 		normaliseHooks(config.Before)
 		normaliseHooks(config.After)
-		stages[index].Before = config.Before
-		stages[index].After = config.After
-		if config.Replace == nil {
-			continue
-		}
-		if len(config.Replace.Command) == 0 {
-			return fmt.Errorf("replacement for stage %q has no command", id)
-		}
-		if len(config.Replace.Produces) == 0 {
-			return fmt.Errorf("replacement for stage %q declares no produced artifacts", id)
-		}
-		for _, output := range stages[index].Outputs {
-			if _, ok := config.Replace.Produces[output.Name]; !ok {
-				return fmt.Errorf("replacement for stage %q does not produce required artifact %q", id, output.Name)
-			}
-		}
-		stages[index].Implementation = "command"
-		stages[index].Replacement = config.Replace
-		for name, path := range config.Replace.Produces {
-			outputIndex := slices.IndexFunc(stages[index].Outputs, func(output Artifact) bool {
-				return output.Name == name
-			})
-			if outputIndex < 0 {
-				stages[index].Outputs = append(stages[index].Outputs, Artifact{
-					Name: name,
-					Type: "custom",
-					Path: filepath.ToSlash(path),
-				})
+		for _, index := range indexes {
+			stages[index].Before = slices.Clone(config.Before)
+			stages[index].After = slices.Clone(config.After)
+			if config.Replace == nil {
 				continue
 			}
-			stages[index].Outputs[outputIndex].Path = filepath.ToSlash(path)
+			if len(config.Replace.Command) == 0 {
+				return fmt.Errorf("replacement for stage %q has no command", id)
+			}
+			if len(config.Replace.Produces) == 0 {
+				return fmt.Errorf("replacement for stage %q declares no produced artifacts", id)
+			}
+			for _, output := range stages[index].Outputs {
+				if _, ok := config.Replace.Produces[output.Name]; !ok {
+					return fmt.Errorf("replacement for stage %q does not produce required artifact %q", id, output.Name)
+				}
+			}
+			stages[index].Implementation = "command"
+			stages[index].Replacement = config.Replace
+			for name, path := range config.Replace.Produces {
+				path = expandTargetPath(path, stages[index].Target)
+				outputIndex := slices.IndexFunc(stages[index].Outputs, func(output Artifact) bool {
+					return output.Name == name
+				})
+				if outputIndex < 0 {
+					stages[index].Outputs = append(stages[index].Outputs, Artifact{
+						Name:   name,
+						Type:   "custom",
+						Path:   filepath.ToSlash(path),
+						Target: artifactTarget(stages[index].Target),
+					})
+					continue
+				}
+				stages[index].Outputs[outputIndex].Path = filepath.ToSlash(path)
+			}
 		}
 	}
 	return nil
+}
+
+func expandTargetPath(path string, target *Target) string {
+	if target == nil {
+		return path
+	}
+	path = strings.ReplaceAll(path, "${target.platform}", target.Platform)
+	return strings.ReplaceAll(path, "${target.arch}", target.Arch)
 }
 
 func normaliseHooks(hooks []Hook) {
@@ -338,81 +350,6 @@ func normaliseHooks(hooks []Hook) {
 		if hooks[index].WorkingDirectory == "" {
 			hooks[index].WorkingDirectory = "${project.root}"
 		}
-	}
-}
-
-type artifactPaths struct {
-	bindings       string
-	frontend       string
-	assets         string
-	platform       string
-	binary         string
-	bundle         string
-	artifactReport string
-}
-
-func defaultStages(paths artifactPaths) []Stage {
-	planned := func(id string, needs []string, inputs, outputs []Artifact) Stage {
-		return Stage{
-			ID:             id,
-			Implementation: "wails/" + id,
-			Needs:          needs,
-			Status:         "planned",
-			Inputs:         inputs,
-			Outputs:        outputs,
-		}
-	}
-	skipped := func(id string, needs []string, reason string) Stage {
-		return Stage{
-			ID:             id,
-			Implementation: "wails/" + id,
-			Needs:          needs,
-			Status:         "skipped",
-			Reason:         reason,
-		}
-	}
-	artifact := func(name, kind, path string) Artifact {
-		return Artifact{Name: name, Type: kind, Path: filepath.ToSlash(path)}
-	}
-
-	return []Stage{
-		planned("project.resolve", nil, nil, []Artifact{artifact("plan", "build-plan", "")}),
-		planned("toolchain.check", []string{"project.resolve"},
-			nil, []Artifact{artifact("capabilities", "capability-report", "")}),
-		planned("dependencies.prepare", []string{"toolchain.check"},
-			nil, []Artifact{artifact("dependencies", "dependency-state", "")}),
-		planned("bindings.generate", []string{"dependencies.prepare"},
-			nil, []Artifact{artifact("bindings", "frontend-bindings", paths.bindings)}),
-		planned("assets.generate", []string{"toolchain.check"},
-			nil, []Artifact{artifact("assets", "platform-assets", paths.assets)}),
-		planned("frontend.build", []string{"dependencies.prepare", "bindings.generate"},
-			[]Artifact{artifact("bindings", "frontend-bindings", paths.bindings)},
-			[]Artifact{artifact("frontend", "frontend-distribution", paths.frontend)}),
-		planned("platform.generate", []string{"assets.generate"},
-			[]Artifact{artifact("assets", "platform-assets", paths.assets)},
-			[]Artifact{artifact("platform", "platform-resources", paths.platform)}),
-		planned("native.compile", []string{"frontend.build", "platform.generate"},
-			[]Artifact{
-				artifact("frontend", "frontend-distribution", paths.frontend),
-				artifact("bindings", "frontend-bindings", paths.bindings),
-				artifact("platform", "platform-resources", paths.platform),
-			},
-			[]Artifact{artifact("binary", "native-binary", paths.binary)}),
-		skipped("binary.combine", []string{"native.compile"},
-			"single-architecture build"),
-		skipped("bundle.assemble", []string{"native.compile", "binary.combine"},
-			"not selected by the build goal"),
-		skipped("bundle.sign", []string{"bundle.assemble"},
-			"not selected by the build goal"),
-		skipped("package.create", []string{"bundle.sign"},
-			"not selected by the build goal"),
-		skipped("package.sign", []string{"package.create"},
-			"not selected by the build goal"),
-		skipped("package.notarize", []string{"package.sign"},
-			"not selected by the build goal"),
-		planned("artifacts.collect", []string{"native.compile"},
-			[]Artifact{artifact("binary", "native-binary", paths.binary)},
-			[]Artifact{artifact("manifest", "artifact-manifest", paths.artifactReport)}),
 	}
 }
 
@@ -470,15 +407,4 @@ func supportedTarget(target string) bool {
 
 func normaliseName(name string) string {
 	return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(name), " ", "-"))
-}
-
-func bundlePath(output, name, target string) string {
-	switch target {
-	case "darwin", "ios":
-		return filepath.Join(output, name+".app")
-	case "linux":
-		return filepath.Join(output, name+".AppDir")
-	default:
-		return output
-	}
 }

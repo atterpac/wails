@@ -525,11 +525,11 @@ func writeContext(stageContext *StageContext) (string, error) {
 	path := filepath.Join(directory, SafeInstanceName(stageContext.Stage.Reference())+".json")
 	payload := struct {
 		Stage     Stage               `json:"stage"`
-		Target    Target              `json:"target"`
+		Targets   []Target            `json:"targets"`
 		Artifacts map[string]Artifact `json:"artifacts"`
 	}{
 		Stage:     stageContext.Stage,
-		Target:    stageContext.Plan.Target,
+		Targets:   stageContext.Plan.Targets,
 		Artifacts: stageContext.Artifacts,
 	}
 	data, err := json.MarshalIndent(payload, "", "  ")
@@ -544,13 +544,14 @@ func writeContext(stageContext *StageContext) (string, error) {
 
 func expand(value string, stageContext *StageContext) string {
 	replacements := map[string]string{
-		"${project.root}":    stageContext.Plan.Project.Root,
-		"${target.platform}": stageContext.Plan.Target.Platform,
-		"${target.arch}":     stageContext.Plan.Target.Arch,
+		"${project.root}": stageContext.Plan.Project.Root,
 	}
 	if stageContext.Stage.Target != nil {
 		replacements["${target.platform}"] = stageContext.Stage.Target.Platform
 		replacements["${target.arch}"] = stageContext.Stage.Target.Arch
+	} else if len(stageContext.Plan.Targets) == 1 {
+		replacements["${target.platform}"] = stageContext.Plan.Targets[0].Platform
+		replacements["${target.arch}"] = stageContext.Plan.Targets[0].Arch
 	}
 	for name, artifact := range stageContext.Artifacts {
 		replacements["${artifacts."+name+"}"] = resolvePath(stageContext.Plan.Project.Root, artifact.Path)

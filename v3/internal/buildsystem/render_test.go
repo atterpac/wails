@@ -21,12 +21,13 @@ func TestPlanRenderers(t *testing.T) {
 	require.NoError(t, WriteJSON(&jsonOutput, plan))
 	var decoded Plan
 	require.NoError(t, json.Unmarshal(jsonOutput.Bytes(), &decoded))
-	assert.Equal(t, plan.Target, decoded.Target)
+	assert.Equal(t, plan.Targets, decoded.Targets)
 	assert.Equal(t, plan.Stages, decoded.Stages)
 
 	var textOutput bytes.Buffer
 	require.NoError(t, WriteText(&textOutput, plan))
-	assert.Contains(t, textOutput.String(), "Build plan: darwin/arm64 (production)")
+	assert.Contains(t, textOutput.String(), "Build plan: 1 target(s) (production)")
+	assert.Contains(t, textOutput.String(), "darwin/arm64 [production]")
 	assert.Contains(t, textOutput.String(), "native.compile")
 	assert.Contains(t, textOutput.String(), "single-architecture build")
 }
@@ -53,26 +54,28 @@ func TestStageInspectionRenderers(t *testing.T) {
 		},
 	}}
 	assert.Equal(t, "native.compile", inspection.Stage.ID)
-	assert.Equal(t, plan.Target, inspection.Target)
+	assert.Equal(t, plan.Targets, inspection.Targets)
 
 	var jsonOutput bytes.Buffer
 	require.NoError(t, WriteStageJSON(&jsonOutput, inspection))
 	var decoded StageInspection
 	require.NoError(t, json.Unmarshal(jsonOutput.Bytes(), &decoded))
 	assert.Equal(t, "native.compile", decoded.Stage.ID)
-	assert.Equal(t, []string{"frontend.build", "platform.generate"}, decoded.Stage.Needs)
+	assert.Equal(t, []string{"frontend.build", "platform.generate[linux/amd64]"}, decoded.Stage.Needs)
 	assert.Equal(t, inspection.Stage.Actions, decoded.Stage.Actions)
 
 	var textOutput bytes.Buffer
 	require.NoError(t, WriteStageText(&textOutput, inspection))
-	assert.Contains(t, textOutput.String(), "Build step:     native.compile")
+	assert.Contains(t, textOutput.String(), "Build step:     native.compile[linux/amd64]")
+	assert.Contains(t, textOutput.String(), "Public stage:   native.compile")
 	assert.Contains(t, textOutput.String(), "Implementation: wails/native.compile")
-	assert.Contains(t, textOutput.String(), "Needs:          frontend.build, platform.generate")
+	assert.Contains(t, textOutput.String(), "Needs:          frontend.build, platform.generate[linux/amd64]")
 	assert.Contains(t, textOutput.String(), "Execution:")
 	assert.Contains(t, textOutput.String(), `"go" "build" "-ldflags=-w -s"`)
 	assert.Contains(t, textOutput.String(), "GOARCH=amd64")
 	assert.Contains(t, textOutput.String(), "frontend (frontend-distribution): frontend/dist")
-	assert.Contains(t, textOutput.String(), "binary (native-binary): bin/")
+	assert.Contains(t, textOutput.String(), "binary[linux/amd64] (native-binary): bin/")
+	assert.Contains(t, textOutput.String(), "producer: native.compile")
 
 	_, err = InspectStage(plan, "missing.stage")
 	require.EqualError(t, err, `unknown build stage "missing.stage"`)

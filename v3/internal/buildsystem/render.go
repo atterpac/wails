@@ -10,11 +10,11 @@ import (
 )
 
 type StageInspection struct {
-	Version string  `json:"version"`
-	Project Project `json:"project"`
-	Target  Target  `json:"target"`
-	Mode    string  `json:"mode"`
-	Stage   Stage   `json:"stage"`
+	Version string   `json:"version"`
+	Project Project  `json:"project"`
+	Targets []Target `json:"targets"`
+	Mode    string   `json:"mode"`
+	Stage   Stage    `json:"stage"`
 }
 
 func WriteJSON(writer io.Writer, plan *Plan) error {
@@ -31,18 +31,17 @@ func InspectStage(plan *Plan, id string) (*StageInspection, error) {
 	if plan == nil {
 		return nil, fmt.Errorf("build plan is nil")
 	}
-	for _, stage := range plan.Stages {
-		if stage.ID == id {
-			return &StageInspection{
-				Version: plan.Version,
-				Project: plan.Project,
-				Target:  plan.Target,
-				Mode:    plan.Mode,
-				Stage:   stage,
-			}, nil
-		}
+	index, err := resolveStageIndex(plan.Stages, id)
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("unknown build stage %q", id)
+	return &StageInspection{
+		Version: plan.Version,
+		Project: plan.Project,
+		Targets: plan.Targets,
+		Mode:    plan.Mode,
+		Stage:   plan.Stages[index],
+	}, nil
 }
 
 func WriteStageJSON(writer io.Writer, inspection *StageInspection) error {
@@ -57,20 +56,31 @@ func WriteStageJSON(writer io.Writer, inspection *StageInspection) error {
 
 func WriteStageText(writer io.Writer, inspection *StageInspection) error {
 	stage := inspection.Stage
-	if _, err := fmt.Fprintf(writer, "Build step:     %s\n", stage.ID); err != nil {
+	if _, err := fmt.Fprintf(writer, "Build step:     %s\n", stage.Reference()); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(
-		writer,
-		"Target:         %s/%s (%s)\n",
-		inspection.Target.Platform,
-		inspection.Target.Arch,
-		inspection.Mode,
-	); err != nil {
-		return err
+	if stage.Reference() != stage.ID {
+		if _, err := fmt.Fprintf(writer, "Public stage:   %s\n", stage.ID); err != nil {
+			return err
+		}
 	}
-	if len(inspection.Target.Tags) > 0 {
-		if _, err := fmt.Fprintf(writer, "Tags:           %s\n", strings.Join(inspection.Target.Tags, ", ")); err != nil {
+	if stage.Target != nil {
+		if _, err := fmt.Fprintf(
+			writer,
+			"Target:         %s/%s (%s)\n",
+			stage.Target.Platform,
+			stage.Target.Arch,
+			inspection.Mode,
+		); err != nil {
+			return err
+		}
+		if len(stage.Target.Tags) > 0 {
+			if _, err := fmt.Fprintf(writer, "Tags:           %s\n", strings.Join(stage.Target.Tags, ", ")); err != nil {
+				return err
+			}
+		}
+	} else {
+		if _, err := fmt.Fprintf(writer, "Target scope:   shared across %d target(s)\n", len(inspection.Targets)); err != nil {
 			return err
 		}
 	}
@@ -287,16 +297,40 @@ func writeArtifacts(writer io.Writer, artifacts []Artifact) error {
 		if path == "" {
 			path = "(in-memory)"
 		}
-		if _, err := fmt.Fprintf(writer, "  %s (%s): %s\n", artifact.Name, artifact.Type, path); err != nil {
+		if _, err := fmt.Fprintf(
+			writer,
+			"  %s (%s): %s\n",
+			artifact.Reference(),
+			artifact.Type,
+			path,
+		); err != nil {
 			return err
+		}
+		if artifact.Producer != "" {
+			if _, err := fmt.Fprintf(writer, "    producer: %s\n", artifact.Producer); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
 func WriteText(writer io.Writer, plan *Plan) error {
-	if _, err := fmt.Fprintf(writer, "Build plan: %s/%s (%s)\n", plan.Target.Platform, plan.Target.Arch, plan.Mode); err != nil {
+	if _, err := fmt.Fprintf(writer, "Build plan: %d target(s) (%s)\n", len(plan.Targets), plan.Mode); err != nil {
 		return err
+	}
+	for _, target := range plan.Targets {
+		if _, err := fmt.Fprintf(writer, "  - %s/%s", target.Platform, target.Arch); err != nil {
+			return err
+		}
+		if len(target.Tags) > 0 {
+			if _, err := fmt.Fprintf(writer, " [%s]", strings.Join(target.Tags, ", ")); err != nil {
+				return err
+			}
+		}
+		if _, err := fmt.Fprintln(writer); err != nil {
+			return err
+		}
 	}
 	if _, err := fmt.Fprintf(writer, "Project:    %s\n", plan.Project.Name); err != nil {
 		return err
@@ -307,16 +341,11 @@ func WriteText(writer io.Writer, plan *Plan) error {
 	if _, err := fmt.Fprintf(writer, "Output:     %s\n", plan.Project.Output); err != nil {
 		return err
 	}
-	if len(plan.Target.Tags) > 0 {
-		if _, err := fmt.Fprintf(writer, "Tags:       %s\n", strings.Join(plan.Target.Tags, ", ")); err != nil {
-			return err
-		}
-	}
 	if _, err := fmt.Fprintln(writer, "\nStages:"); err != nil {
 		return err
 	}
 	for _, stage := range plan.Stages {
-		line := fmt.Sprintf("  %-22s %-7s", stage.ID, stage.Status)
+		line := fmt.Sprintf("  %-38s %-7s", stage.Reference(), stage.Status)
 		if stage.Reason != "" {
 			line += "  " + stage.Reason
 		} else if stage.Replacement != nil {
@@ -339,7 +368,13 @@ func WriteText(writer io.Writer, plan *Plan) error {
 			if output.Path == "" {
 				continue
 			}
-			if _, err := fmt.Fprintf(writer, "    -> %s (%s): %s\n", output.Name, output.Type, output.Path); err != nil {
+			if _, err := fmt.Fprintf(
+				writer,
+				"    -> %s (%s): %s\n",
+				output.Reference(),
+				output.Type,
+				output.Path,
+			); err != nil {
 				return err
 			}
 		}
