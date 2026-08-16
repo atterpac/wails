@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -15,29 +14,26 @@ import (
 	"github.com/pterm/pterm"
 	"github.com/wailsapp/wails/v3/internal/flags"
 	"github.com/wailsapp/wails/v3/internal/keychain"
+	"gopkg.in/yaml.v3"
 )
 
-// SigningSetup configures signing variables in platform Taskfiles
+// SigningSetup configures signing in the user-owned typed build configuration.
 func SigningSetup(options *flags.SigningSetup) error {
 	// Determine which platforms to configure
 	platforms := options.Platforms
 	if len(platforms) == 0 {
-		// Auto-detect based on existing Taskfiles
-		platforms = detectPlatforms()
-		if len(platforms) == 0 {
-			return fmt.Errorf("no platform Taskfiles found in build/ directory")
-		}
+		platforms = []string{"darwin", "windows", "linux"}
 	}
 
 	for _, platform := range platforms {
 		var err error
 		switch platform {
 		case "darwin":
-			err = setupDarwinSigning()
+			err = setupDarwinSigning(options.Config)
 		case "windows":
-			err = setupWindowsSigning()
+			err = setupWindowsSigning(options.Config)
 		case "linux":
-			err = setupLinuxSigning()
+			err = setupLinuxSigning(options.Config)
 		default:
 			pterm.Warning.Printfln("Unknown platform: %s", platform)
 			continue
@@ -50,18 +46,7 @@ func SigningSetup(options *flags.SigningSetup) error {
 	return nil
 }
 
-func detectPlatforms() []string {
-	var platforms []string
-	for _, p := range []string{"darwin", "windows", "linux"} {
-		taskfile := filepath.Join("build", p, "Taskfile.yml")
-		if _, err := os.Stat(taskfile); err == nil {
-			platforms = append(platforms, p)
-		}
-	}
-	return platforms
-}
-
-func setupDarwinSigning() error {
+func setupDarwinSigning(configPath string) error {
 	pterm.DefaultHeader.Println("macOS Code Signing Setup")
 	fmt.Println()
 
@@ -141,18 +126,16 @@ func setupDarwinSigning() error {
 		signIdentity = ""
 	}
 
-	// Update Taskfile
-	taskfilePath := filepath.Join("build", "darwin", "Taskfile.yml")
-	err = updateTaskfileVars(taskfilePath, map[string]string{
-		"SIGN_IDENTITY":    signIdentity,
-		"KEYCHAIN_PROFILE": keychainProfile,
-		"ENTITLEMENTS":     entitlements,
+	err = updateSigningConfig(configPath, "darwin", map[string]string{
+		"identity":        signIdentity,
+		"keychainProfile": keychainProfile,
+		"entitlements":    entitlements,
 	})
 	if err != nil {
 		return err
 	}
 
-	pterm.Success.Printfln("Updated %s", taskfilePath)
+	pterm.Success.Printfln("Updated %s", configPath)
 
 	if configureNotarization && keychainProfile != "" {
 		fmt.Println()
@@ -169,7 +152,7 @@ func setupDarwinSigning() error {
 	return nil
 }
 
-func setupWindowsSigning() error {
+func setupWindowsSigning(configPath string) error {
 	pterm.DefaultHeader.Println("Windows Code Signing Setup")
 	fmt.Println()
 
@@ -239,28 +222,28 @@ func setupWindowsSigning() error {
 		pterm.Success.Println("Certificate password stored in system keychain")
 	}
 
-	// Update Taskfile (no passwords stored here)
-	taskfilePath := filepath.Join("build", "windows", "Taskfile.yml")
 	vars := map[string]string{
-		"TIMESTAMP_SERVER": timestampServer,
+		"timestampServer": timestampServer,
+		"certificate":     "",
+		"thumbprint":      "",
 	}
 
 	if certSource == "file" {
-		vars["SIGN_CERTIFICATE"] = certPath
+		vars["certificate"] = certPath
 	} else {
-		vars["SIGN_THUMBPRINT"] = thumbprint
+		vars["thumbprint"] = thumbprint
 	}
 
-	err = updateTaskfileVars(taskfilePath, vars)
+	err = updateSigningConfig(configPath, "windows", vars)
 	if err != nil {
 		return err
 	}
 
-	pterm.Success.Printfln("Updated %s", taskfilePath)
+	pterm.Success.Printfln("Updated %s", configPath)
 	return nil
 }
 
-func setupLinuxSigning() error {
+func setupLinuxSigning(configPath string) error {
 	pterm.DefaultHeader.Println("Linux Package Signing Setup")
 	fmt.Println()
 
@@ -388,21 +371,20 @@ func setupLinuxSigning() error {
 		pterm.Success.Println("PGP key password stored in system keychain")
 	}
 
-	// Update Taskfile (no passwords stored here)
-	taskfilePath := filepath.Join("build", "linux", "Taskfile.yml")
 	vars := map[string]string{
-		"PGP_KEY": keyPath,
+		"pgpKey": keyPath,
+		"role":   "",
 	}
 	if signRole != "" && signRole != "builder" {
-		vars["SIGN_ROLE"] = signRole
+		vars["role"] = signRole
 	}
 
-	err = updateTaskfileVars(taskfilePath, vars)
+	err = updateSigningConfig(configPath, "linux", vars)
 	if err != nil {
 		return err
 	}
 
-	pterm.Success.Printfln("Updated %s", taskfilePath)
+	pterm.Success.Printfln("Updated %s", configPath)
 	return nil
 }
 
@@ -440,81 +422,39 @@ func getMacOSSigningIdentities() ([]string, error) {
 	return identities, nil
 }
 
-// updateTaskfileVars updates the vars section of a Taskfile
-func updateTaskfileVars(path string, vars map[string]string) error {
+func updateSigningConfig(path, platform string, values map[string]string) error {
 	content, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("failed to read %s: %w", path, err)
+		return fmt.Errorf("read build configuration %s: %w", path, err)
 	}
-
-	lines := strings.Split(string(content), "\n")
-	var result []string
-	inVars := false
-	varsInserted := false
-	remainingVars := make(map[string]string)
-	for k, v := range vars {
-		remainingVars[k] = v
+	var config map[string]any
+	if err := yaml.Unmarshal(content, &config); err != nil {
+		return fmt.Errorf("parse build configuration %s: %w", path, err)
 	}
-
-	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-
-		// Detect vars section
-		if trimmed == "vars:" {
-			inVars = true
-			result = append(result, line)
-			continue
-		}
-
-		// Detect end of vars section (next top-level key or tasks:)
-		if inVars && len(line) > 0 && line[0] != ' ' && line[0] != '\t' && !strings.HasPrefix(trimmed, "#") {
-			// Insert any remaining vars before leaving vars section
-			for k, v := range remainingVars {
-				if v != "" {
-					result = append(result, fmt.Sprintf("  %s: %q", k, v))
-				}
-			}
-			remainingVars = make(map[string]string)
-			varsInserted = true
-			inVars = false
-		}
-
-		if inVars {
-			// Check if this line is a var we want to update
-			updated := false
-			for k, v := range remainingVars {
-				commentedKey := "# " + k + ":"
-				uncommentedKey := k + ":"
-
-				if strings.Contains(trimmed, commentedKey) || strings.HasPrefix(trimmed, uncommentedKey) {
-					if v != "" {
-						// Uncomment and set value
-						result = append(result, fmt.Sprintf("  %s: %q", k, v))
-					} else {
-						// Keep as comment
-						result = append(result, line)
-					}
-					delete(remainingVars, k)
-					updated = true
-					break
-				}
-			}
-			if !updated {
-				result = append(result, line)
-			}
+	build := ensureStringMap(config, "build")
+	signing := ensureStringMap(build, "signing")
+	platformConfig := ensureStringMap(signing, platform)
+	for key, value := range values {
+		if value == "" {
+			delete(platformConfig, key)
 		} else {
-			result = append(result, line)
-		}
-
-		// If we're at the end and haven't inserted vars yet, we need to add vars section
-		if i == len(lines)-1 && !varsInserted && len(remainingVars) > 0 {
-			// Find where to insert (after includes, before tasks)
-			// For simplicity, just append warning
-			pterm.Warning.Println("Could not find vars section in Taskfile, please add manually")
+			platformConfig[key] = value
 		}
 	}
+	updated, err := yaml.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("encode build configuration %s: %w", path, err)
+	}
+	return os.WriteFile(path, updated, 0o644)
+}
 
-	return os.WriteFile(path, []byte(strings.Join(result, "\n")), 0644)
+func ensureStringMap(parent map[string]any, key string) map[string]any {
+	if existing, ok := parent[key].(map[string]any); ok {
+		return existing
+	}
+	created := make(map[string]any)
+	parent[key] = created
+	return created
 }
 
 // generatePGPKeyForSetup generates a PGP key pair for signing packages

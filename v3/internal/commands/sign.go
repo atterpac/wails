@@ -17,7 +17,7 @@ import (
 // resolveSigningDefaults fills in any signing options not supplied via flags from
 // the global config (~/.config/wails/defaults.yaml). This makes the signing
 // configuration written by `wails3 setup` take effect at sign time for every
-// platform — flags (and therefore project Taskfile vars) still win when present.
+// platform — explicit flags still win over typed project configuration.
 func resolveSigningDefaults(options *flags.Sign) {
 	cfg, err := defaults.Load()
 	if err != nil {
@@ -340,7 +340,7 @@ func signWindowsBuiltin(options *flags.Sign, password string) error {
 
 func signDEB(options *flags.Sign) error {
 	if options.PGPKey == "" {
-		return fmt.Errorf("no PGP signing key found for DEB signing — pass --pgp-key, set PGP_KEY in build/linux/Taskfile.yml, or run `wails3 setup` / `wails3 setup signing`")
+		return fmt.Errorf("no PGP signing key found for DEB signing — pass --pgp-key, configure build.signing.linux.pgpKey, or run `wails3 setup signing`")
 	}
 
 	// Get password from keychain if not provided
@@ -400,7 +400,7 @@ func signDEBWithGPG(options *flags.Sign, password, role string) error {
 
 func signRPM(options *flags.Sign) error {
 	if options.PGPKey == "" {
-		return fmt.Errorf("no PGP signing key found for RPM signing — pass --pgp-key, set PGP_KEY in build/linux/Taskfile.yml, or run `wails3 setup` / `wails3 setup signing`")
+		return fmt.Errorf("no PGP signing key found for RPM signing — pass --pgp-key, configure build.signing.linux.pgpKey, or run `wails3 setup signing`")
 	}
 
 	// Get password from keychain if not provided
