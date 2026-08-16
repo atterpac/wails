@@ -181,6 +181,20 @@ func defaultStages(plan *Plan, frontendOutput string, packageFormats []string) [
 		nativeStages[key] = stage
 		stages = append(stages, stage)
 	}
+	if plan.Variant == "server" {
+		var artifacts []Artifact
+		var needs []string
+		for _, target := range plan.Targets {
+			native := nativeStages[targetKey(target)]
+			artifacts = append(artifacts, native.Outputs...)
+			needs = append(needs, native.Reference())
+		}
+		stages = append(stages, planned(
+			"artifacts.collect", nil, needs, artifacts,
+			[]Artifact{sharedArtifact("manifest", "artifact-manifest", filepath.Join(plan.Project.Output, "artifacts.json"), "artifacts.collect")},
+		))
+		return stages
+	}
 
 	finalArtifacts := make([]Artifact, 0, len(plan.Targets)+1)
 	finalNeeds := make([]string, 0, len(plan.Targets)+1)

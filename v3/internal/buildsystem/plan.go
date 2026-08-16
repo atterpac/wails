@@ -29,6 +29,7 @@ type Request struct {
 	Mode        string
 	Tags        []string
 	Obfuscated  bool
+	Server      bool
 	Goal        string
 	Packages    []string
 }
@@ -39,6 +40,7 @@ type Plan struct {
 	Targets     []Target      `json:"targets"`
 	Mode        string        `json:"mode"`
 	Goal        string        `json:"goal"`
+	Variant     string        `json:"variant,omitempty"`
 	Signing     SigningConfig `json:"signing,omitempty"`
 	Stages      []Stage       `json:"stages"`
 	Diagnostics []string      `json:"diagnostics,omitempty"`
@@ -332,6 +334,9 @@ func Resolve(request Request) (*Plan, error) {
 		mode = "production"
 	}
 	tags := mergeTags(cfg.Build.Tags, request.Tags)
+	if request.Server {
+		tags = mergeTags(tags, []string{"server"})
+	}
 	if mode == "production" {
 		tags = mergeTags(tags, []string{"production"})
 	}
@@ -384,6 +389,10 @@ func Resolve(request Request) (*Plan, error) {
 		Mode:    mode,
 		Goal:    goal,
 		Signing: cfg.Build.Signing,
+	}
+	if request.Server {
+		plan.Variant = "server"
+		plan.Project.BinaryName += "-server"
 	}
 	if provider := plan.Signing.Credentials.Provider; provider != "" && provider != "environment" && provider != "keychain" {
 		return nil, fmt.Errorf("unsupported signing credential provider %q", provider)

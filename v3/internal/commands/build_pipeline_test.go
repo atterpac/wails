@@ -79,6 +79,51 @@ func TestResolveBuildActionsExpandsNativeCompile(t *testing.T) {
 	assert.True(t, native.Actions[3].Finally)
 }
 
+func TestResolveObfuscatedBuildUsesGarbleCommand(t *testing.T) {
+	root := t.TempDir()
+	plan, err := buildsystem.Resolve(buildsystem.Request{ProjectRoot: root, Target: "linux", Arch: "amd64", Obfuscated: true})
+	require.NoError(t, err)
+	require.NoError(t, resolveBuildActions(plan, &flags.Build{Obfuscated: true, GarbleArgs: `-literals -seed="example seed"`}))
+	native := commandStage(t, plan, "native.compile")
+	require.GreaterOrEqual(t, len(native.Actions), 3)
+	assert.Equal(t, buildsystem.ActionCheckTool, native.Actions[1].Kind)
+	assert.Equal(t, "garble", native.Actions[1].Tool)
+	assert.Equal(t, []string{"garble", "-literals", "-seed=example seed", "build"}, native.Actions[2].Command[:4])
+}
+
+func TestResolveServerBuildStopsAtNativeArtifact(t *testing.T) {
+	root := t.TempDir()
+	plan, err := buildsystem.Resolve(buildsystem.Request{ProjectRoot: root, Target: "linux", Arch: "amd64", Server: true})
+	require.NoError(t, err)
+	require.NoError(t, resolveBuildActions(plan, &flags.Build{Server: true}))
+	assert.Equal(t, "server", plan.Variant)
+	assert.Empty(t, stagesByOperation(plan, "bundle.assemble"))
+	native := commandStage(t, plan, "native.compile")
+	assert.Equal(t, filepath.Base(root)+"-server", filepath.Base(native.Outputs[0].Path))
+	compile := native.Actions[len(native.Actions)-1]
+	assert.Contains(t, compile.Command, "server,production")
+	assert.Equal(t, "0", compile.Environment["CGO_ENABLED"])
+}
+
+func TestResolveDockerBuildProducesExactContainerCommand(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/app\n\ngo 1.26\n"), 0o644))
+	plan, err := buildsystem.Resolve(buildsystem.Request{ProjectRoot: root, Target: "darwin", Arch: "arm64"})
+	require.NoError(t, err)
+	require.NoError(t, resolveBuildActions(plan, &flags.Build{Docker: true, DockerImage: "example/wails-cross"}))
+	native := commandStage(t, plan, "native.compile")
+	var container buildsystem.Action
+	for _, action := range native.Actions {
+		if action.Description == "Compile the application in Docker" {
+			container = action
+		}
+	}
+	require.NotEmpty(t, container.Command)
+	assert.Equal(t, "docker", container.Command[0])
+	assert.Contains(t, container.Command, "example/wails-cross")
+	assert.Equal(t, []string{"darwin", "arm64"}, container.Command[len(container.Command)-2:])
+}
+
 func TestResolveBuildActionsAppliesStageSettingsAndOverlays(t *testing.T) {
 	root := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(root, "build"), 0o755))

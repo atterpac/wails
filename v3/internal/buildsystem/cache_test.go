@@ -81,6 +81,21 @@ func TestStageCacheInvalidatesWhenProjectSourcesChange(t *testing.T) {
 	assert.Equal(t, "stored", report.Stages[0].Cache)
 }
 
+func TestStageCacheSeparatesBuildVariants(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, "source.go"), []byte("package main"), 0o644))
+	desktop := cacheTestPlan(root, filepath.Join(root, "dist", "application"))
+	server := cacheTestPlan(root, filepath.Join(root, "dist", "application"))
+	server.Variant = "server"
+	store, err := newCacheStore(desktop, "", "")
+	require.NoError(t, err)
+	desktopFingerprint, err := store.fingerprint(desktop, desktop.Stages[0], nil)
+	require.NoError(t, err)
+	serverFingerprint, err := store.fingerprint(server, server.Stages[0], nil)
+	require.NoError(t, err)
+	assert.NotEqual(t, desktopFingerprint, serverFingerprint)
+}
+
 func TestCorruptCacheEntryFallsBackToStageExecution(t *testing.T) {
 	root := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(root, "source.go"), []byte("package main"), 0o644))

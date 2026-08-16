@@ -134,6 +134,7 @@ func printTypedPipelinePlan(
 		Mode:       mode,
 		Tags:       strings.Split(buildFlags.Tags, ","),
 		Obfuscated: buildFlags.Obfuscated,
+		Server:     buildFlags.Server,
 		Goal:       goal,
 		Packages:   buildFlags.Packages,
 	})

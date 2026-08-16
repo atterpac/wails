@@ -49,6 +49,7 @@ func executeTypedPipeline(
 		Mode:       mode,
 		Tags:       strings.Split(buildFlags.Tags, ","),
 		Obfuscated: buildFlags.Obfuscated,
+		Server:     buildFlags.Server,
 		Goal:       goal,
 		Packages:   buildFlags.Packages,
 	})
@@ -790,7 +791,7 @@ func nativeCompileActions(
 	}
 
 	var temporaryResource string
-	if stage.Target.Platform == "windows" {
+	if stage.Target.Platform == "windows" && plan.Variant != "server" {
 		if platform, ok := optionalStageInputPath(plan, stage, "platform"); ok {
 			name := "rsrc_windows_" + stage.Target.Arch + ".syso"
 			temporaryResource = filepath.Join(plan.Project.Root, name)
@@ -840,6 +841,9 @@ func nativeCompileActions(
 		environment["CGO_CFLAGS"] = "-mmacosx-version-min=12.0"
 		environment["CGO_LDFLAGS"] = "-mmacosx-version-min=12.0"
 		environment["MACOSX_DEPLOYMENT_TARGET"] = "12.0"
+	}
+	if plan.Variant == "server" {
+		environment = map[string]string{"GOOS": stage.Target.Platform, "GOARCH": stage.Target.Arch, "CGO_ENABLED": "0"}
 	}
 	actions = append(actions, buildsystem.Action{
 		Kind:             buildsystem.ActionCommand,

@@ -93,13 +93,14 @@ func (store *cacheStore) fingerprint(plan *Plan, stage Stage, artifacts map[stri
 		PlanVersion   string            `json:"planVersion"`
 		Mode          string            `json:"mode"`
 		Goal          string            `json:"goal"`
+		Variant       string            `json:"variant,omitempty"`
 		Project       Project           `json:"project"`
 		Signing       SigningConfig     `json:"signing"`
 		Stage         Stage             `json:"stage"`
 		WorkspaceHash string            `json:"workspaceHash"`
 		Inputs        map[string]string `json:"inputs"`
 		HookInputs    map[string]string `json:"hookInputs"`
-	}{cacheFormatVersion, plan.Version, plan.Mode, plan.Goal, plan.Project, plan.Signing, stage, store.workspaceHash, inputs, hookInputs}
+	}{cacheFormatVersion, plan.Version, plan.Mode, plan.Goal, plan.Variant, plan.Project, plan.Signing, stage, store.workspaceHash, inputs, hookInputs}
 	payload.Project.Root = ""
 	payload.Project.Config = ""
 	data, err := json.Marshal(payload)

@@ -44,6 +44,12 @@ func main() {
 	build.LongDescription("\nUsage:\n  wails3 build [flags]\n  wails3 build step <stage> [flags]\n\nUse --plan to inspect the typed pipeline, --pipeline to execute it, or --from/--until to execute a stage range.")
 
 	app.NewSubCommandFunction("dev", "Run in Dev mode", commands.Dev)
+	server := app.NewSubCommand("server", "Build and run Wails HTTP server applications")
+	server.NewSubCommandFunction("build", "Build the server binary", commands.ServerBuild)
+	server.NewSubCommandFunction("run", "Build and run a development server", commands.ServerRun)
+	server.NewSubCommandFunction("docker:build", "Build the server container image", commands.ServerDockerBuild)
+	server.NewSubCommandFunction("docker:run", "Build and run the server container image", commands.ServerDockerRun)
+	server.NewSubCommandFunction("docker:setup-cross", "Build the Wails cross-compilation image", commands.CrossDockerSetup)
 
 	pkg := app.NewSubCommand("package", "Package application")
 	var pkgFlags flags.Package
