@@ -21,21 +21,22 @@ the **Mobile** and **Hardware** tabs appear on both iOS and Android.
 
 ```bash
 # iOS Simulator (requires full Xcode)
-GOWORK=off wails3 task ios:run
+GOWORK=off wails3 dev --target ios
 
 # Android emulator (requires the Android SDK + NDK + a JDK)
-GOWORK=off wails3 task android:run
+GOWORK=off wails3 dev --target android
 
 # Android physical device (USB debugging enabled)
 adb devices
-GOWORK=off DEVICE_ID=<serial> wails3 task android:run:device
-GOWORK=off DEVICE_ID=<serial> wails3 task android:deploy-device
+GOWORK=off wails3 dev --target android/arm64 --device <serial>
+GOWORK=off wails3 android deploy --device <serial> --artifact bin/mobile.apk
 
 # Desktop
-GOWORK=off wails3 task run
+GOWORK=off wails3 dev
 ```
 
-`GOWORK=off wails3 task ios:package` / `GOWORK=off wails3 task android:package`
+`GOWORK=off wails3 package --target ios/arm64 --format ipa` /
+`GOWORK=off wails3 package --target android/arm64 --format apk`
 produce release builds. See
 [`../../IOS.md`](../../IOS.md) and [`../../ANDROID.md`](../../ANDROID.md) for the
 toolchain requirements and device/signing details. `GOWORK=off` is only needed

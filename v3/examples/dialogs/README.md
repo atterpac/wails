@@ -15,13 +15,13 @@ go run main.go
 To build the example in debug mode, simply run the following command:
 
 ```bash
-wails3 task build
+wails3 build DEV=true
 ```
 
 To build the example to use application icons, simply run the following command:
 
 ```bash
-wails3 task package
+wails3 package
 ```
 
 # Status

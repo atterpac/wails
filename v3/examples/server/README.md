@@ -15,14 +15,14 @@ Server mode allows you to run your Wails application as a pure HTTP server. This
 
 ## Building and Running
 
-The recommended way to build server mode applications is using the Taskfile:
+Use the typed server commands:
 
 ```bash
 # Build for server mode
-wails3 task build:server
+wails3 server build
 
 # Build and run
-wails3 task run:server
+wails3 server run
 ```
 
 Or using Go directly:
@@ -91,8 +91,8 @@ curl http://localhost:8080/health
 ## Building for Production
 
 ```bash
-# Using Taskfile (recommended)
-wails3 task build:server
+# Using the typed build system
+wails3 server build
 
 # Or using Go directly
 go build -tags server -o myapp-server .
@@ -100,17 +100,17 @@ go build -tags server -o myapp-server .
 
 ## Docker
 
-Build and run with Docker using the built-in tasks:
+Build and run with Docker using the built-in commands:
 
 ```bash
 # Build Docker image
-task build:docker
+wails3 server docker:build
 
 # Build and run
-task run:docker
+wails3 server docker:run
 
 # Run on a different port
-task run:docker PORT=3000
+wails3 server docker:run --port 3000
 ```
 
 Or build manually:
