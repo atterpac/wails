@@ -1250,9 +1250,17 @@ func packageCreateActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]bu
 		}
 		gradleTask := "assembleRelease"
 		generated := filepath.Join(input, "app", "build", "outputs", "apk", "release", "app-release.apk")
+		if plan.Mode == "development" {
+			gradleTask = "assembleDebug"
+			generated = filepath.Join(input, "app", "build", "outputs", "apk", "debug", "app-debug.apk")
+		}
 		if format == "aab" {
 			gradleTask = "bundleRelease"
 			generated = filepath.Join(input, "app", "build", "outputs", "bundle", "release", "app-release.aab")
+			if plan.Mode == "development" {
+				gradleTask = "bundleDebug"
+				generated = filepath.Join(input, "app", "build", "outputs", "bundle", "debug", "app-debug.aab")
+			}
 		}
 		return append(actions,
 			buildsystem.Action{

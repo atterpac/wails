@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/wailsapp/wails/v3/internal/flags"
 )
@@ -19,16 +20,26 @@ type DevOptions struct {
 	Config   string `description:"The config file including path" default:"./build/config.yml"`
 	VitePort int    `name:"port" description:"Specify the vite dev server port"`
 	Secure   bool   `name:"s" description:"Enable HTTPS"`
-	Pipeline bool   `name:"pipeline" description:"Use the typed Wails development pipeline"`
+	Pipeline bool   `name:"pipeline" description:"Explicitly select typed development (now the default)"`
+	Legacy   bool   `name:"legacy-taskfile" description:"Use generated compatibility Taskfiles for development"`
 	Plan     bool   `name:"plan" description:"Print the resolved development plan without executing it"`
 	JSON     bool   `name:"json" description:"Print the development plan as JSON (requires --plan)"`
+	Target   string `name:"target" description:"Development target as platform or platform/architecture"`
+	Device   string `name:"device" description:"Mobile device serial or identifier"`
+	Host     string `name:"host" description:"Frontend host visible to the application"`
 }
 
 func Dev(options *DevOptions) error {
 	if options.JSON && !options.Plan {
 		return fmt.Errorf("--json requires --plan")
 	}
-	host := "localhost"
+	host := options.Host
+	if host == "" {
+		host = "localhost"
+		if options.Target == "android" || strings.HasPrefix(options.Target, "android/") {
+			host = "10.0.2.2"
+		}
+	}
 
 	// flag takes precedence over environment variable
 	var port int
@@ -43,7 +54,7 @@ func Dev(options *DevOptions) error {
 	// Inspection is side-effect free; only execution probes whether the port is
 	// available before starting the frontend process.
 	if !options.Plan {
-		l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", host, port))
+		l, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", port))
 		if err != nil {
 			return err
 		}
@@ -62,13 +73,13 @@ func Dev(options *DevOptions) error {
 		os.Setenv("FRONTEND_DEVSERVER_URL", fmt.Sprintf("http://%s:%d", host, port))
 	}
 
-	// Environment variables such as WAILS_MCP imply extra build tags. Export them
-	// via EXTRA_TAGS so the project Taskfile includes them in dev builds.
+	// Preserve implied tags for the explicit legacy Taskfile path. Typed dev
+	// resolves the same tags directly into its nested build plan.
 	if tags := envTags(); len(tags) > 0 {
 		os.Setenv("EXTRA_TAGS", mergeTags(os.Getenv("EXTRA_TAGS"), tags...))
 	}
 
-	if options.Pipeline || options.Plan {
+	if !options.Legacy || options.Plan {
 		plan, err := resolveTypedDevPlan(options, host, port)
 		if err != nil {
 			return err

@@ -30,7 +30,7 @@ func TestResolveDevProducesExactSupervisedProcesses(t *testing.T) {
 	assert.Equal(t, "dev.compile", dev.Processes[0].ID)
 	assert.Equal(t, "blocking", dev.Processes[0].Type)
 	assert.Equal(t, []string{
-		"C:/tools/wails3.exe", "build", "--pipeline", "--config", filepath.Join(root, "build", "config.yml"), "DEV=true", "--tags", "mcp",
+		"C:/tools/wails3.exe", "build", "--pipeline", "--config", filepath.Join(root, "build", "config.yml"), "--target", "windows/amd64", "DEV=true", "--tags", "mcp",
 	}, dev.Processes[0].Command)
 	assert.Equal(t, []string{"pnpm", "dev", "--port", "9245", "--strictPort"}, dev.Processes[1].Command)
 	assert.Equal(t, "background", dev.Processes[1].Type)
@@ -72,8 +72,15 @@ func TestResolveDevUsesPlatformBundleExecutable(t *testing.T) {
 	}
 }
 
-func TestResolveDevRejectsMobileTarget(t *testing.T) {
+func TestResolveDevProducesAndroidDeploymentProcess(t *testing.T) {
+	root := t.TempDir()
 	target := Target{Platform: "android", Arch: "arm64"}
-	_, err := ResolveDev(&Plan{Mode: "development", Targets: []Target{target}}, DevRequest{CLIPath: "wails3", Port: 9245})
-	require.EqualError(t, err, `typed development mode does not yet support target "android"`)
+	plan := &Plan{Mode: "development", Project: Project{
+		Root: root, Config: filepath.Join(root, "build", "config.yml"), BinaryName: "example", Output: "bin", Frontend: "frontend", PackageManager: "npm",
+	}, Targets: []Target{target}}
+	dev, err := ResolveDev(plan, DevRequest{CLIPath: "wails3", Host: "10.0.2.2", Port: 9245, Device: "device-1"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"wails3", "package", "--pipeline", "--config", plan.Project.Config, "--target", "android/arm64", "--format", "apk", "DEV=true"}, dev.Processes[0].Command)
+	assert.Contains(t, dev.Processes[1].Command, "0.0.0.0")
+	assert.Equal(t, []string{"wails3", "android", "dev:run", "--config", plan.Project.Config, "--artifact", filepath.Join(root, "bin", "example.apk"), "--device", "device-1"}, dev.Processes[2].Command)
 }

@@ -19,17 +19,31 @@ func resolveTypedDevPlan(options *DevOptions, host string, port int) (*buildsyst
 	if err != nil {
 		return nil, err
 	}
+	platform, arch, err := devTarget(options.Target, options.Device)
+	if err != nil {
+		return nil, err
+	}
 	buildFlags := &flags.Build{Config: options.Config, Pipeline: true, Tags: strings.Join(envTags(), ",")}
+	goal := "build"
+	var packages []string
+	if platform == "android" {
+		goal = "package"
+		packages = []string{"apk"}
+	}
 	build, err := buildsystem.Resolve(buildsystem.Request{
 		ConfigPath: options.Config,
-		Target:     runtime.GOOS,
-		Arch:       runtime.GOARCH,
+		Target:     platform,
+		Arch:       arch,
 		Mode:       "development",
 		Tags:       envTags(),
-		Goal:       "build",
+		Goal:       goal,
+		Packages:   packages,
 	})
 	if err != nil {
 		return nil, err
+	}
+	if platform == "ios" && arch == "arm64" && build.Signing.IOS.Identity == "" {
+		return nil, fmt.Errorf("iOS device development requires build.signing.ios.identity in %s", build.Project.Config)
 	}
 	if err := resolveTypedPipelineActions(build, buildFlags, nil); err != nil {
 		return nil, err
@@ -40,7 +54,7 @@ func resolveTypedDevPlan(options *DevOptions, host string, port int) (*buildsyst
 	}
 	plan, err := buildsystem.ResolveDev(build, buildsystem.DevRequest{
 		CLIPath: cliPath, ConfigPath: options.Config, Host: host, Port: port,
-		Secure: options.Secure, Tags: envTags(),
+		Secure: options.Secure, Tags: envTags(), Device: options.Device,
 	})
 	if err != nil {
 		return nil, err
@@ -54,6 +68,28 @@ func resolveTypedDevPlan(options *DevOptions, host string, port int) (*buildsyst
 		GitIgnore:          watch.Ignore.IgnoreGit,
 	}
 	return plan, nil
+}
+
+func devTarget(value, device string) (string, string, error) {
+	if value == "" {
+		return runtime.GOOS, runtime.GOARCH, nil
+	}
+	parts := strings.Split(value, "/")
+	if len(parts) > 2 || parts[0] == "" {
+		return "", "", fmt.Errorf("invalid development target %q; expected platform or platform/architecture", value)
+	}
+	if len(parts) == 2 && parts[1] != "" {
+		return parts[0], parts[1], nil
+	}
+	switch parts[0] {
+	case "android", "ios":
+		if device != "" {
+			return parts[0], "arm64", nil
+		}
+		return parts[0], "amd64", nil
+	default:
+		return parts[0], runtime.GOARCH, nil
+	}
 }
 
 func executeTypedDevPlan(options *DevOptions, plan *buildsystem.DevPlan) error {

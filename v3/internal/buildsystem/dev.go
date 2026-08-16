@@ -50,6 +50,7 @@ type DevRequest struct {
 	Port       int
 	Secure     bool
 	Tags       []string
+	Device     string
 }
 
 func ResolveDev(build *Plan, request DevRequest) (*DevPlan, error) {
@@ -63,7 +64,7 @@ func ResolveDev(build *Plan, request DevRequest) (*DevPlan, error) {
 		return nil, fmt.Errorf("development mode requires exactly one target")
 	}
 	target := build.Targets[0]
-	if target.Platform != "windows" && target.Platform != "darwin" && target.Platform != "linux" {
+	if target.Platform != "windows" && target.Platform != "darwin" && target.Platform != "linux" && target.Platform != "android" && target.Platform != "ios" {
 		return nil, fmt.Errorf("typed development mode does not yet support target %q", target.Platform)
 	}
 	if request.CLIPath == "" {
@@ -87,7 +88,10 @@ func ResolveDev(build *Plan, request DevRequest) (*DevPlan, error) {
 		configPath = filepath.Join(build.Project.Root, configPath)
 	}
 
-	compile := []string{request.CLIPath, "build", "--pipeline", "--config", configPath, "DEV=true"}
+	compile := []string{request.CLIPath, "build", "--pipeline", "--config", configPath, "--target", target.Platform + "/" + target.Arch, "DEV=true"}
+	if target.Platform == "android" {
+		compile = []string{request.CLIPath, "package", "--pipeline", "--config", configPath, "--target", target.Platform + "/" + target.Arch, "--format", "apk", "DEV=true"}
+	}
 	if tags := joinNonEmpty(request.Tags); tags != "" {
 		compile = append(compile, "--tags", tags)
 	}
@@ -95,7 +99,10 @@ func ResolveDev(build *Plan, request DevRequest) (*DevPlan, error) {
 	if err != nil {
 		return nil, err
 	}
-	runnable, err := devRunnable(build, target)
+	if target.Platform == "android" || target.Platform == "ios" {
+		frontend = append(frontend, "--host", "0.0.0.0")
+	}
+	runnable, err := devRunnableCommand(build, target, request, configPath)
 	if err != nil {
 		return nil, err
 	}
@@ -118,17 +125,41 @@ func ResolveDev(build *Plan, request DevRequest) (*DevPlan, error) {
 			{
 				ID: "dev.frontend", Type: "background", Command: frontend,
 				WorkingDirectory: filepath.Join(build.Project.Root, build.Project.Frontend), Environment: environment,
-				Readiness:       &DevReadiness{TCP: request.Host + ":" + strconv.Itoa(request.Port), Timeout: "30s", Interval: "100ms"},
+				Readiness:       &DevReadiness{TCP: "localhost:" + strconv.Itoa(request.Port), Timeout: "30s", Interval: "100ms"},
 				ShutdownTimeout: "5s",
 				ExitPolicy:      "fail",
 			},
 			{
-				ID: "dev.launch", Type: "primary", Command: []string{runnable},
+				ID: "dev.launch", Type: "primary", Command: runnable,
 				WorkingDirectory: build.Project.Root, Environment: environment, ShutdownTimeout: "5s", ExitPolicy: "shutdown",
 			},
 		},
 		Build: build,
 	}, nil
+}
+
+func devRunnableCommand(plan *Plan, target Target, request DevRequest, configPath string) ([]string, error) {
+	if target.Platform == "android" {
+		artifact := filepath.Join(plan.Project.Root, plan.Project.Output, plan.Project.BinaryName+".apk")
+		command := []string{request.CLIPath, "android", "dev:run", "--config", configPath, "--artifact", artifact}
+		if request.Device != "" {
+			command = append(command, "--device", request.Device)
+		}
+		return command, nil
+	}
+	if target.Platform == "ios" {
+		artifact := filepath.Join(plan.Project.Root, plan.Project.Output, plan.Project.BinaryName+".app")
+		command := []string{request.CLIPath, "ios", "dev:run", "--config", configPath, "--artifact", artifact}
+		if request.Device != "" {
+			command = append(command, "--device", request.Device)
+		}
+		return command, nil
+	}
+	runnable, err := devRunnable(plan, target)
+	if err != nil {
+		return nil, err
+	}
+	return []string{runnable}, nil
 }
 
 func devFrontendCommand(packageManager string, port int) ([]string, error) {
