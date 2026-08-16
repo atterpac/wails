@@ -53,6 +53,7 @@ type BuildAssetsOptions struct {
 	Silent                bool   `description:"Suppress output to console"`
 	Typescript            bool   `description:"Use typescript" default:"false"`
 	UseInterfaces         bool   `description:"Generate TypeScript interfaces instead of classes"`
+	LegacyTaskfiles       bool   `name:"legacy-taskfiles" description:"Generate compatibility platform Taskfiles"`
 }
 
 type TemplateEnrichment struct {
@@ -164,6 +165,15 @@ func GenerateBuildAssets(options *BuildAssetsOptions) error {
 	err = gosod.New(tfs).Extract(options.Dir, config)
 	if err != nil {
 		return err
+	}
+	if !options.LegacyTaskfiles {
+		for _, relative := range []string{
+			"Taskfile.yml", "darwin/Taskfile.yml", "windows/Taskfile.yml", "linux/Taskfile.yml", "android/Taskfile.yml", "ios/Taskfile.yml",
+		} {
+			if err := os.Remove(filepath.Join(options.Dir, relative)); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("remove generated compatibility Taskfile %s: %w", relative, err)
+			}
+		}
 	}
 	// Check if Assets.car exists - if so, set CFBundleIconName if not already set
 	// This must happen BEFORE the updatable_build_assets extraction so CFBundleIconName is available in Info.plist templates

@@ -79,11 +79,7 @@ func Build(buildFlags *flags.Build, otherArgs []string) error {
 	if buildFlags.Plan {
 		return printBuildPlan(buildFlags, pipelineArgs, step)
 	}
-	explicitPipeline, err := buildsystem.UsesExplicitPipeline(buildFlags.Config)
-	if err != nil {
-		return err
-	}
-	if buildFlags.Pipeline || explicitPipeline || buildFlags.From != "" || buildFlags.Until != "" || step != "" ||
+	if !buildFlags.Legacy || buildFlags.From != "" || buildFlags.Until != "" || step != "" ||
 		buildFlags.NoCache || buildFlags.Resume || buildFlags.CacheDir != "" || buildFlags.Report != "" {
 		return executeBuildPipeline(buildFlags, pipelineArgs, step)
 	}
@@ -205,11 +201,7 @@ func Package(options *flags.Package, otherArgs []string) error {
 	if options.JSON && !options.Plan {
 		return fmt.Errorf("--json requires --plan")
 	}
-	explicitPipeline, err := buildsystem.UsesExplicitPipeline(options.Config)
-	if err != nil {
-		return err
-	}
-	if packagePipelineRequested(options) || explicitPipeline {
+	if !options.Legacy || packagePipelineRequested(options) {
 		buildFlags := packageBuildFlags(options)
 		if options.Plan {
 			return printTypedPipelinePlan(buildFlags, nil, "package", otherArgs, "")
@@ -223,11 +215,7 @@ func SignWrapper(options *flags.SignWrapper, otherArgs []string) error {
 	if options.JSON && !options.Plan {
 		return fmt.Errorf("--json requires --plan")
 	}
-	explicitPipeline, err := buildsystem.UsesExplicitPipeline(options.Config)
-	if err != nil {
-		return err
-	}
-	if signingPipelineRequested(options) || explicitPipeline {
+	if !options.Legacy || signingPipelineRequested(options) {
 		buildFlags := signBuildFlags(options)
 		signOptions := pipelineSignOptions(options)
 		goal := "sign"

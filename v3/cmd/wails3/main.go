@@ -41,7 +41,7 @@ func main() {
 	build.Action(func() error {
 		return commands.Build(&buildFlags, build.OtherArgs())
 	})
-	build.LongDescription("\nUsage:\n  wails3 build [flags]\n  wails3 build step <stage> [flags]\n\nUse --plan to inspect the typed pipeline, --pipeline to execute it, or --from/--until to execute a stage range.")
+	build.LongDescription("\nUsage:\n  wails3 build [flags]\n  wails3 build step <stage> [flags]\n\nBuilds use the typed pipeline by default. Use --plan to inspect it, --config-export to write a commented customization reference, --from/--until to execute a stage range, or --legacy-taskfile for compatibility.")
 
 	app.NewSubCommandFunction("dev", "Run in Dev mode", commands.Dev)
 	server := app.NewSubCommand("server", "Build and run Wails HTTP server applications")
@@ -57,7 +57,7 @@ func main() {
 	pkg.Action(func() error {
 		return commands.Package(&pkgFlags, pkg.OtherArgs())
 	})
-	pkg.LongDescription("\nUse --plan to inspect the typed package pipeline or --pipeline to execute it. Repeat --format and --target to select package outputs.")
+	pkg.LongDescription("\nUses the typed package pipeline by default. Repeat --format and --target to select outputs, or use --legacy-taskfile for compatibility.")
 	doctorCmd := app.NewSubCommand("doctor", "System status report")
 	var doctorFlags flags.Doctor
 	doctorCmd.AddFlags(&doctorFlags)
@@ -145,7 +145,7 @@ func main() {
 	sign.Action(func() error {
 		return commands.SignWrapper(&signWrapperFlags, sign.OtherArgs())
 	})
-	sign.LongDescription("\nUse --plan to inspect the typed signing pipeline or --pipeline to execute it. --notarize enables Apple notarization and stapling.")
+	sign.LongDescription("\nUses the typed signing pipeline by default. --notarize enables Apple notarization and stapling; --legacy-taskfile selects compatibility execution.")
 
 	// Updater publishing tools (the Wails Update Manifest protocol)
 	updaterCmd := app.NewSubCommand("updater", "Self-update publishing tools (keys, signing, manifests)")

@@ -17,7 +17,6 @@ how to customise it, and how to publish it so others can use it.
 ├── go.mod.tmpl            # Go module file
 ├── go.sum.tmpl            # Go module checksums
 ├── gitignore.tmpl         # Becomes .gitignore in the generated project
-├── Taskfile.tmpl.yml      # Build task definitions
 └── frontend/              # Your frontend code goes here
 ```
 

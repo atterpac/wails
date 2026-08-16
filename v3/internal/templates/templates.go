@@ -556,7 +556,7 @@ func GenerateTemplate(options *BaseTemplate) error {
 		return err
 	}
 
-	// Copy the common files (Go backend, Taskfile, go.mod, etc.) verbatim.
+	// Copy the common files (Go backend, go.mod, etc.) verbatim.
 	// These files contain template variables like {{.ProjectName}} that must be
 	// preserved so they are expanded when users later run `wails init -t <template>`.
 	commonFS, err := fs.Sub(templates, "_common")

@@ -217,7 +217,7 @@ func TestBuildCommand(t *testing.T) {
 	os.Unsetenv("GOARCH")
 
 	// Test Build command
-	buildFlags := &flags.Build{}
+	buildFlags := &flags.Build{Legacy: true}
 	otherArgs := []string{"CONFIG=release"}
 
 	err := Build(buildFlags, otherArgs)
@@ -320,7 +320,7 @@ func TestBuildCommandWithTags(t *testing.T) {
 	os.Unsetenv("GOARCH")
 
 	// Test Build command with tags
-	buildFlags := &flags.Build{}
+	buildFlags := &flags.Build{Legacy: true}
 	buildFlags.Tags = "gtk4"
 	otherArgs := []string{"CONFIG=release"}
 
@@ -369,7 +369,7 @@ func TestBuildCommandWithMultipleTags(t *testing.T) {
 	os.Unsetenv("GOARCH")
 
 	// Test Build command with multiple comma-separated tags
-	buildFlags := &flags.Build{}
+	buildFlags := &flags.Build{Legacy: true}
 	buildFlags.Tags = "gtk4,server"
 
 	err := Build(buildFlags, nil)
@@ -420,6 +420,7 @@ func TestBuildCommandWithObfuscation(t *testing.T) {
 		Tags:       "gtk4",
 		Obfuscated: true,
 		GarbleArgs: "-literals -tiny",
+		Legacy:     true,
 	}
 
 	err := Build(buildFlags, nil)
@@ -467,7 +468,7 @@ func TestBuildCommandWithoutTags(t *testing.T) {
 	os.Unsetenv("GOARCH")
 
 	// Test Build command without tags - no EXTRA_TAGS should be present
-	buildFlags := &flags.Build{}
+	buildFlags := &flags.Build{Legacy: true}
 
 	err := Build(buildFlags, nil)
 	assert.NoError(t, err)
@@ -514,7 +515,7 @@ func TestPackageCommand(t *testing.T) {
 	os.Unsetenv("GOARCH")
 
 	// Test Package command
-	packageFlags := &flags.Package{}
+	packageFlags := &flags.Package{Legacy: true}
 	otherArgs := []string{"VERSION=2.0.0", "OUTPUT=myapp.dmg"}
 
 	err := Package(packageFlags, otherArgs)
@@ -562,7 +563,7 @@ func TestSignWrapperCommand(t *testing.T) {
 	os.Unsetenv("GOARCH")
 
 	// Test SignWrapper command
-	signFlags := &flags.SignWrapper{}
+	signFlags := &flags.SignWrapper{Legacy: true}
 	otherArgs := []string{"IDENTITY=Developer ID"}
 
 	err := SignWrapper(signFlags, otherArgs)
