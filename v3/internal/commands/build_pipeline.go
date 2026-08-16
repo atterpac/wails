@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/shlex"
 	"github.com/wailsapp/wails/v3/internal/buildsystem"
 	"github.com/wailsapp/wails/v3/internal/flags"
 	"github.com/wailsapp/wails/v3/internal/packager"
@@ -674,13 +675,6 @@ func nativeCompileActions(
 	if stage.Target == nil {
 		return nil, fmt.Errorf("stage %s has no target", stage.Reference())
 	}
-	if buildFlags.Obfuscated {
-		return []buildsystem.Action{internalBuildAction(
-			"native.compile",
-			"Compile the obfuscated native application",
-		)}, nil
-	}
-
 	output, err := planStageOutputPath(plan, stage, "binary")
 	if err != nil {
 		return nil, err
@@ -691,12 +685,58 @@ func nativeCompileActions(
 		Status:      "planned",
 		Path:        filepath.Dir(output),
 	}}
+	if buildFlags.Obfuscated && !buildFlags.Docker {
+		actions = append(actions, buildsystem.Action{
+			Kind: buildsystem.ActionCheckTool, Description: "Check the garble compiler", Status: "planned", Tool: "garble",
+		})
+	}
+	if buildFlags.Docker {
+		if !slices.Contains([]string{"windows", "darwin", "linux"}, stage.Target.Platform) {
+			return nil, fmt.Errorf("Docker cross-compilation is not supported for %s targets", stage.Target.Platform)
+		}
+		mounts, err := dockerMountArguments(plan.Project.Root)
+		if err != nil {
+			return nil, err
+		}
+		image := buildFlags.DockerImage
+		if image == "" {
+			image = "wails-cross"
+		}
+		dockerCommand := []string{"docker", "run", "--rm", "-v", plan.Project.Root + ":/app"}
+		dockerCommand = append(dockerCommand, mounts...)
+		dockerCommand = append(dockerCommand, "-e", "APP_NAME="+plan.Project.BinaryName)
+		if len(stage.Target.Tags) > 0 {
+			dockerCommand = append(dockerCommand, "-e", "EXTRA_TAGS="+strings.Join(stage.Target.Tags, ","))
+		}
+		if buildFlags.Obfuscated {
+			dockerCommand = append(dockerCommand, "-e", "OBFUSCATED=true")
+			if buildFlags.GarbleArgs != "" {
+				dockerCommand = append(dockerCommand, "-e", "GARBLE_ARGS="+buildFlags.GarbleArgs)
+			}
+		}
+		dockerCommand = append(dockerCommand, image, stage.Target.Platform, stage.Target.Arch)
+		generatedName := plan.Project.BinaryName + "-" + stage.Target.Platform + "-" + stage.Target.Arch
+		if stage.Target.Platform == "windows" {
+			generatedName += ".exe"
+		}
+		generated := filepath.Join(plan.Project.Root, "bin", generatedName)
+		return append(actions,
+			buildsystem.Action{Kind: buildsystem.ActionCheckTool, Description: "Check Docker", Status: "planned", Tool: "docker"},
+			buildsystem.Action{Kind: buildsystem.ActionCommand, Description: "Check the Wails cross-build image", Status: "planned", Command: []string{"docker", "image", "inspect", image}, WorkingDirectory: plan.Project.Root},
+			buildsystem.Action{Kind: buildsystem.ActionCommand, Description: "Compile the application in Docker", Status: "planned", Command: dockerCommand, WorkingDirectory: plan.Project.Root},
+			buildsystem.Action{Kind: buildsystem.ActionCopy, Description: "Collect the Docker-built binary", Status: "planned", Source: generated, Destination: output},
+			buildsystem.Action{Kind: buildsystem.ActionRemove, Description: "Remove the Docker intermediate binary", Status: "planned", Finally: true, Path: generated},
+		), nil
+	}
 	if stage.Target.Platform == "android" {
 		platform, err := stageInputPath(plan, stage, "platform")
 		if err != nil {
 			return nil, err
 		}
-		command := []string{"go", "build", "-buildmode=c-shared", "-overlay", filepath.Join(platform, "overlay.json")}
+		command, err := goBuildCommand(buildFlags, "-buildmode=c-shared", "-overlay", filepath.Join(platform, "overlay.json"))
+		if err != nil {
+			return nil, err
+		}
 		tags := appendUniqueStrings(stage.Target.Tags, "android")
 		if len(tags) > 0 {
 			command = append(command, "-tags", strings.Join(tags, ","))
@@ -717,7 +757,10 @@ func nativeCompileActions(
 		if err != nil {
 			return nil, err
 		}
-		command := []string{"go", "build", "-buildmode=c-archive", "-overlay", filepath.Join(platform, "overlay.json")}
+		command, err := goBuildCommand(buildFlags, "-buildmode=c-archive", "-overlay", filepath.Join(platform, "overlay.json"))
+		if err != nil {
+			return nil, err
+		}
 		tags := appendUniqueStrings(stage.Target.Tags, "ios")
 		if len(tags) > 0 {
 			command = append(command, "-tags", strings.Join(tags, ","))
@@ -761,7 +804,10 @@ func nativeCompileActions(
 		}
 	}
 
-	command := []string{"go", "build"}
+	command, err := goBuildCommand(buildFlags)
+	if err != nil {
+		return nil, err
+	}
 	tags := stage.Target.Tags
 	if configured, ok := stageSettingStrings(stage, "tags"); ok {
 		tags = appendUniqueStrings(tags, configured...)
@@ -813,6 +859,19 @@ func nativeCompileActions(
 		})
 	}
 	return actions, nil
+}
+
+func goBuildCommand(buildFlags *flags.Build, arguments ...string) ([]string, error) {
+	if !buildFlags.Obfuscated {
+		return append([]string{"go", "build"}, arguments...), nil
+	}
+	garbleArguments, err := shlex.Split(buildFlags.GarbleArgs)
+	if err != nil {
+		return nil, fmt.Errorf("parse garble arguments: %w", err)
+	}
+	command := append([]string{"garble"}, garbleArguments...)
+	command = append(command, "build")
+	return append(command, arguments...), nil
 }
 
 func androidCompileScript(arch string, command []string) (string, error) {
@@ -1415,14 +1474,7 @@ func buildInternalActions(_ *flags.Build) map[string]buildsystem.ActionFunc {
 		"package.linux":                 createLinuxPackageAction,
 		"artifact.sign":                 signArtifactAction,
 		"artifact.notarize":             notarizeArtifactAction,
-		"native.compile": func(
-			context.Context,
-			*buildsystem.StageContext,
-			buildsystem.Action,
-		) error {
-			return fmt.Errorf("obfuscated builds are not yet supported by the typed executor")
-		},
-		"artifacts.collect": collectArtifactsAction,
+		"artifacts.collect":             collectArtifactsAction,
 	}
 }
 

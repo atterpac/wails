@@ -57,7 +57,19 @@ func ToolHas(opts *HasOptions) error {
 // POSIX sh and cmd.exe (go-task may use either on Windows).
 func ToolDockerMounts(_ *DockerMountsOptions) error {
 	DisableFooter = true
+	mounts, err := dockerMountArguments(".")
+	if err != nil {
+		return err
+	}
+	var rendered []string
+	for index := 0; index < len(mounts); index += 2 {
+		rendered = append(rendered, fmt.Sprintf(`%s "%s"`, mounts[index], mounts[index+1]))
+	}
+	fmt.Print(strings.Join(rendered, " "))
+	return nil
+}
 
+func dockerMountArguments(projectRoot string) ([]string, error) {
 	var mounts []string
 
 	// Add Go module cache mount. GOPATH may contain multiple entries
@@ -65,20 +77,21 @@ func ToolDockerMounts(_ *DockerMountsOptions) error {
 	gopath := firstGOPATHEntry()
 	if gopath != "" {
 		hostPath := filepath.ToSlash(gopath)
-		mounts = append(mounts, fmt.Sprintf(`-v "%s/pkg/mod:/go/pkg/mod"`, hostPath))
+		mounts = append(mounts, "-v", hostPath+"/pkg/mod:/go/pkg/mod")
 	}
 
 	// Parse go.mod for local replace directives and add volume mounts.
 	// Relative replace paths map under /app (the container project root);
 	// absolute replace paths are mounted at the same path inside the container,
 	// because Go inside the container resolves them literally.
-	data, err := os.ReadFile("go.mod")
+	goModPath := filepath.Join(projectRoot, "go.mod")
+	data, err := os.ReadFile(goModPath)
 	if err != nil {
-		return fmt.Errorf("reading go.mod: %w", err)
+		return nil, fmt.Errorf("reading go.mod: %w", err)
 	}
-	f, err := modfile.Parse("go.mod", data, nil)
+	f, err := modfile.Parse(goModPath, data, nil)
 	if err != nil {
-		return fmt.Errorf("parsing go.mod: %w", err)
+		return nil, fmt.Errorf("parsing go.mod: %w", err)
 	}
 	for _, r := range f.Replace {
 		// Only handle local directory replacements (no version = local path)
@@ -90,9 +103,9 @@ func ToolDockerMounts(_ *DockerMountsOptions) error {
 		// Resolve absolute host path from the (possibly relative) replace path.
 		hostAbsPath := relPath
 		if !filepath.IsAbs(relPath) {
-			abs, err := filepath.Abs(relPath)
+			abs, err := filepath.Abs(filepath.Join(projectRoot, relPath))
 			if err != nil {
-				return fmt.Errorf("resolving replace path %q: %w", relPath, err)
+				return nil, fmt.Errorf("resolving replace path %q: %w", relPath, err)
 			}
 			hostAbsPath = abs
 		}
@@ -121,11 +134,9 @@ func ToolDockerMounts(_ *DockerMountsOptions) error {
 			containerPath = path.Clean("/app/" + relPath)
 		}
 
-		mounts = append(mounts, fmt.Sprintf(`-v "%s:%s:ro"`, hostDockerPath, containerPath))
+		mounts = append(mounts, "-v", hostDockerPath+":"+containerPath+":ro")
 	}
-
-	fmt.Print(strings.Join(mounts, " "))
-	return nil
+	return mounts, nil
 }
 
 // firstGOPATHEntry returns the first entry from GOPATH, or ~/go when unset.
