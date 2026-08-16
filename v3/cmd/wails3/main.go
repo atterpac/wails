@@ -164,10 +164,21 @@ func main() {
 	ios := app.NewSubCommand("ios", "iOS tooling")
 	ios.NewSubCommandFunction("overlay:gen", "Generate Go overlay for iOS bridge shim", commands.IOSOverlayGen)
 	ios.NewSubCommandFunction("xcode:gen", "Generate Xcode project in output directory", commands.IOSXcodeGen)
+	ios.NewSubCommand("devices", "List connected iOS devices").Action(commands.IOSDevices)
+	ios.NewSubCommandFunction("dev:run", "Install, launch, and supervise a built iOS app", commands.IOSDevRun)
+	ios.NewSubCommandFunction("deploy", "Install and launch a built iOS app", commands.IOSDeploy)
+	ios.NewSubCommandFunction("logs", "Stream iOS logs", commands.IOSLogs)
+	ios.NewSubCommand("xcode", "Open the generated Xcode project").Action(commands.IOSXcode)
 
 	// Android tools
 	android := app.NewSubCommand("android", "Android tooling")
 	android.NewSubCommandFunction("overlay:gen", "Generate Go overlay that registers the Android main", commands.AndroidOverlayGen)
+	android.NewSubCommand("devices", "List connected Android devices and emulators").Action(commands.AndroidDevices)
+	android.NewSubCommandFunction("dev:run", "Install, launch, and supervise a built Android app", commands.AndroidDevRun)
+	android.NewSubCommandFunction("deploy", "Install and launch a built Android app", commands.AndroidDeploy)
+	android.NewSubCommandFunction("logs", "Stream Android logs", commands.AndroidLogs)
+	android.NewSubCommand("studio", "Open the generated Android Studio project").Action(commands.AndroidStudio)
+	android.NewSubCommand("clean", "Remove Android build outputs").Action(commands.AndroidClean)
 
 	app.NewSubCommandFunction("version", "Print the version", commands.Version)
 	app.NewSubCommand("sponsor", "Sponsor the project").Action(openSponsor)

@@ -1006,7 +1006,13 @@ func bundleAssembleActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]b
 		}
 		mainDirectory := filepath.Join(platform, "main")
 		executable := filepath.Join(bundle, strings.ToLower(plan.Project.BinaryName))
-		return []buildsystem.Action{
+		infoPlist := filepath.Join(mainDirectory, "Info.plist")
+		if plan.Mode == "development" {
+			if candidate := filepath.Join(plan.Project.Root, "build", "ios", "Info.dev.plist"); fileExists(candidate) {
+				infoPlist = candidate
+			}
+		}
+		actions := []buildsystem.Action{
 			{Kind: buildsystem.ActionRemove, Description: "Remove the previous iOS application bundle", Status: "planned", Recursive: true, Path: bundle},
 			{Kind: buildsystem.ActionMkdir, Description: "Create the iOS application bundle", Status: "planned", Path: bundle},
 			{Kind: buildsystem.ActionCommand, Description: "Link the iOS application executable", Status: "planned",
@@ -1018,7 +1024,7 @@ func bundleAssembleActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]b
 					"-o", executable, filepath.Join(mainDirectory, "main.m"), "-Wl,-force_load," + binary},
 				WorkingDirectory: plan.Project.Root,
 			},
-			{Kind: buildsystem.ActionCopy, Description: "Install the iOS application property list", Status: "planned", Source: filepath.Join(mainDirectory, "Info.plist"), Destination: filepath.Join(bundle, "Info.plist")},
+			{Kind: buildsystem.ActionCopy, Description: "Install the iOS application property list", Status: "planned", Source: infoPlist, Destination: filepath.Join(bundle, "Info.plist")},
 			{Kind: buildsystem.ActionCommand, Description: "Compile the iOS asset catalog", Status: "planned",
 				Command: []string{"xcrun", "actool", "--compile", bundle, "--app-icon", "AppIcon", "--platform", sdk,
 					"--minimum-deployment-target", "13.0", "--product-type", "com.apple.product-type.application",
@@ -1030,7 +1036,28 @@ func bundleAssembleActions(plan *buildsystem.Plan, stage buildsystem.Stage) ([]b
 				Command:          []string{"/usr/libexec/PlistBuddy", "-c", "Merge " + filepath.Join(bundle, "assetcatalog_generated_info.plist"), filepath.Join(bundle, "Info.plist")},
 				WorkingDirectory: plan.Project.Root,
 			},
-		}, nil
+		}
+		identity := "-"
+		description := "Ad-hoc sign the iOS simulator bundle"
+		if stage.Target.Arch == "arm64" {
+			identity = plan.Signing.IOS.Identity
+			if identity == "" {
+				identity = "-"
+				description = "Ad-hoc sign the iOS device bundle"
+			} else {
+				description = "Sign the iOS device bundle"
+			}
+			if profile := absoluteConfiguredPath(plan.Project.Root, plan.Signing.IOS.ProvisioningProfile); profile != "" {
+				actions = append(actions, buildsystem.Action{Kind: buildsystem.ActionCopy, Description: "Embed the iOS provisioning profile", Status: "planned", Source: profile, Destination: filepath.Join(bundle, "embedded.mobileprovision")})
+			}
+		}
+		signCommand := []string{"codesign", "--force", "--sign", identity}
+		if entitlements := absoluteConfiguredPath(plan.Project.Root, plan.Signing.IOS.Entitlements); stage.Target.Arch == "arm64" && entitlements != "" {
+			signCommand = append(signCommand, "--entitlements", entitlements)
+		}
+		signCommand = append(signCommand, bundle)
+		actions = append(actions, buildsystem.Action{Kind: buildsystem.ActionCommand, Description: description, Status: "planned", Command: signCommand, WorkingDirectory: plan.Project.Root})
+		return actions, nil
 	case "darwin":
 		platform, ok := optionalStageInputPath(plan, stage, "platform")
 		if !ok {
@@ -1344,10 +1371,18 @@ func resolvePipelineSigningOptions(plan *buildsystem.Plan, provided *flags.Sign)
 		*result = *provided
 	}
 	if result.Identity == "" {
-		result.Identity = plan.Signing.Darwin.Identity
+		if len(plan.Targets) == 1 && plan.Targets[0].Platform == "ios" {
+			result.Identity = plan.Signing.IOS.Identity
+		} else {
+			result.Identity = plan.Signing.Darwin.Identity
+		}
 	}
 	if result.Entitlements == "" {
-		result.Entitlements = plan.Signing.Darwin.Entitlements
+		if len(plan.Targets) == 1 && plan.Targets[0].Platform == "ios" {
+			result.Entitlements = plan.Signing.IOS.Entitlements
+		} else {
+			result.Entitlements = plan.Signing.Darwin.Entitlements
+		}
 	}
 	if result.KeychainProfile == "" {
 		result.KeychainProfile = plan.Signing.Darwin.KeychainProfile

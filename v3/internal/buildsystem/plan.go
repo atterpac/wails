@@ -238,6 +238,11 @@ type SigningConfig struct {
 		Entitlements    string `yaml:"entitlements" json:"entitlements,omitempty"`
 		KeychainProfile string `yaml:"keychainProfile" json:"keychainProfile,omitempty"`
 	} `yaml:"darwin" json:"darwin,omitempty"`
+	IOS struct {
+		Identity            string `yaml:"identity" json:"identity,omitempty"`
+		Entitlements        string `yaml:"entitlements" json:"entitlements,omitempty"`
+		ProvisioningProfile string `yaml:"provisioningProfile" json:"provisioningProfile,omitempty"`
+	} `yaml:"ios" json:"ios,omitempty"`
 	Windows struct {
 		Certificate     string `yaml:"certificate" json:"certificate,omitempty"`
 		Thumbprint      string `yaml:"thumbprint" json:"thumbprint,omitempty"`

@@ -448,9 +448,27 @@ func TestResolveIOSProductionPipeline(t *testing.T) {
 	bundle := commandStage(t, plan, "bundle.assemble")
 	assert.Equal(t, "xcrun", bundle.Actions[2].Command[0])
 	assert.Equal(t, "actool", bundle.Actions[4].Command[1])
+	assert.Equal(t, []string{"codesign", "--force", "--sign", "-", filepath.Join(root, "bin", filepath.Base(root)+".app")}, bundle.Actions[len(bundle.Actions)-1].Command)
 	packaging := commandStage(t, plan, "package.create")
 	assert.True(t, packaging.Actions[3].Recursive)
 	assert.Equal(t, "package.zip", packaging.Actions[4].Internal)
+}
+
+func TestResolveIOSDeviceSigningConfiguration(t *testing.T) {
+	root := t.TempDir()
+	plan, err := buildsystem.Resolve(buildsystem.Request{ProjectRoot: root, Target: "ios", Arch: "arm64", Goal: "build", Mode: "development"})
+	require.NoError(t, err)
+	plan.Signing.IOS.Identity = "Apple Development: Example"
+	plan.Signing.IOS.Entitlements = "build/ios/entitlements.plist"
+	plan.Signing.IOS.ProvisioningProfile = "build/ios/profile.mobileprovision"
+	require.NoError(t, resolveBuildActions(plan, &flags.Build{}))
+
+	bundle := commandStage(t, plan, "bundle.assemble")
+	assert.Equal(t, filepath.Join(root, "build", "ios", "profile.mobileprovision"), bundle.Actions[len(bundle.Actions)-2].Source)
+	assert.Equal(t, []string{
+		"codesign", "--force", "--sign", "Apple Development: Example", "--entitlements",
+		filepath.Join(root, "build", "ios", "entitlements.plist"), filepath.Join(root, "bin", filepath.Base(root)+".app"),
+	}, bundle.Actions[len(bundle.Actions)-1].Command)
 }
 
 func stagesByOperation(plan *buildsystem.Plan, operation string) []buildsystem.Stage {
