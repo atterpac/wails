@@ -69,6 +69,13 @@ func mergeTags(tags string, extra ...string) string {
 
 func Build(buildFlags *flags.Build, otherArgs []string) error {
 	buildFlags.Tags = mergeTags(buildFlags.Tags, envTags()...)
+	if buildFlags.ConfigExport {
+		if len(otherArgs) > 0 {
+			return fmt.Errorf("--config-export does not accept build arguments")
+		}
+		DisableFooter = true
+		return exportBuildConfigReference(defaultBuildConfigReference)
+	}
 	step, pipelineArgs, err := buildStepInvocation(otherArgs)
 	if err != nil {
 		return err
